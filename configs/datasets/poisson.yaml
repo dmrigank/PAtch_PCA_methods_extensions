@@ -1,0 +1,7 @@
+dataset:
+  name: poisson
+  processed_path: data/processed/poisson_128.npz
+  input_keys:
+    - f
+  output_key: u
+  grid_size: 128

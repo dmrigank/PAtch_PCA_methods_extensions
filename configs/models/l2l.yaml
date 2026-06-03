@@ -1,0 +1,14 @@
+experiment:
+  name: poisson_l2l_seed0
+  output_dir: results/poisson_l2l_seed0
+
+pca:
+  type: local_to_local
+
+patches:
+  patch_size: 32
+  stride: 32
+  assembly: average
+
+model:
+  type: mlp

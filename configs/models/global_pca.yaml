@@ -1,0 +1,9 @@
+experiment:
+  name: poisson_global_pca_seed0
+  output_dir: results/poisson_global_pca_seed0
+
+pca:
+  type: global
+
+model:
+  type: mlp

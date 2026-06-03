@@ -1,0 +1,17 @@
+dataset:
+  name: darcy
+  processed_path: data/processed/darcy_128.npz
+  input_keys:
+    - a
+  output_key: u
+  grid_size: 128
+
+evaluation:
+  metrics:
+    - mse
+    - mae
+    - mre
+    - ssim
+    - relative_spectrum_error
+    - interface_jump
+    - darcy_residual

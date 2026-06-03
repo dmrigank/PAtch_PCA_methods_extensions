@@ -1,0 +1,37 @@
+/data/
+/outputs/
+/paper_assets/
+/results/
+/legacy/
+*.mat
+*.npz
+*.pt
+*.pth
+*.joblib
+*.pdf
+*.md
+!README.md
+!DESIGN.md
+__pycache__/
+.ipynb_checkpoints/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+build/
+dist/
+
+# Local/editor/runtime files
+.DS_Store
+*.pyc
+*.pyo
+*.swp
+*.swo
+
+# Project-local manuscript/dev notes and archived notebooks
+notebooks/legacy/
+AGENTS.md
+AUDIT_REPORT.md
+CODEX_PROMPTS.md
+PAPER_PLOTS_CODEX_PROMPT.md
+runs_update.md

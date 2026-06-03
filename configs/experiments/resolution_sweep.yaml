@@ -1,0 +1,8 @@
+experiment:
+  name: resolution_sweep
+  seed: 0
+
+matrix:
+  resolutions: [64, 128, 256]
+  models: [l2l, l2l_overlap, full]
+  seeds: [0, 1, 2, 3, 4]

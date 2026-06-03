@@ -1,0 +1,10 @@
+experiment:
+  name: factorial
+  seed: 0
+
+matrix:
+  mechanisms:
+    two_scale: [false, true]
+    coupling: [false, true]
+    in_loop_loss: [false, true]
+  seeds: [0, 1, 2, 3, 4]
