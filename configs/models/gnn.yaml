@@ -1,0 +1,19 @@
+experiment:
+  name: l2l_gnn_seed0
+  output_dir: results/l2l_gnn_seed0
+
+mechanisms:
+  coupling: true
+
+pca:
+  type: local_to_local
+
+patches:
+  patch_size: 32
+  stride: 32
+  assembly: average
+
+model:
+  type: gnn
+  embed_dim: 64
+  num_layers: 3

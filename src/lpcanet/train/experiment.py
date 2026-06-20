@@ -14,6 +14,7 @@ import torch
 from lpcanet.assembly.windows import hann2d, safe_hann2d
 from lpcanet.data.io import load_npz, save_npz
 from lpcanet.data.splits import make_splits
+from lpcanet.models.coupling_operator import CouplingOperator
 from lpcanet.models.mlp import MLP, count_parameters
 from lpcanet.models.patchwise_heads import (
     FlatPatchwiseHeadAdapter,
@@ -261,6 +262,24 @@ def _make_model(model_cfg: dict[str, Any], encoder: Any, *, input_dim: int, outp
             input_dim=input_dim,
             output_dim=output_dim,
             hidden_size=hidden_size,
+            num_layers=num_layers,
+            activation=activation,
+            dropout=dropout,
+        )
+    if model_type == "gnn":
+        counts = getattr(encoder, "component_counts", {})
+        input_counts = [int(v) for v in counts.get("input_patches", [])]
+        output_counts = [int(v) for v in counts.get("output_patches", [])]
+        if not input_counts or not output_counts:
+            raise ValueError("GNN coupling operator requires a fitted local-to-local PCA encoder.")
+        patch_slices = getattr(encoder, "patch_slices", [])
+        patch_grid_shape = _patch_grid_shape(patch_slices)
+        return CouplingOperator(
+            input_component_counts=input_counts,
+            output_component_counts=output_counts,
+            patch_slices=patch_slices,
+            patch_grid_shape=patch_grid_shape,
+            embed_dim=int(model_cfg.get("embed_dim", 64)),
             num_layers=num_layers,
             activation=activation,
             dropout=dropout,
