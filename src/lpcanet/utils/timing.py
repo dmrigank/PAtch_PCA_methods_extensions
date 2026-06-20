@@ -9,12 +9,13 @@ from types import TracebackType
 from typing import Any
 
 PCA_FIT = "pca_fit"
+COARSE_SVD = "coarse_svd"
 LATENT_TRANSFORM = "latent_transform"
 NN_TRAIN = "nn_train"
 INFERENCE = "inference"
 END_TO_END = "end_to_end"
 
-STAGE_KEYS = (PCA_FIT, LATENT_TRANSFORM, NN_TRAIN, INFERENCE, END_TO_END)
+STAGE_KEYS = (PCA_FIT, COARSE_SVD, LATENT_TRANSFORM, NN_TRAIN, INFERENCE, END_TO_END)
 
 
 class Timer:

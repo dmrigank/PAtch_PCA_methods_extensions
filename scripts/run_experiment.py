@@ -15,6 +15,12 @@ if str(SRC) not in sys.path:
 
 from lpcanet.metrics.evaluate import evaluate_run
 from lpcanet.train.experiment import train_from_config
+from lpcanet.train.factorial import (
+    run_baselines,
+    run_factorial,
+    run_method_study,
+    run_resolution_sweep,
+)
 from lpcanet.utils.config import compose_config, save_config
 from lpcanet.utils.paths import ensure_dir
 
@@ -102,16 +108,79 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default=None)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("-m", "--multirun", action="store_true")
+    parser.add_argument("--include-optional", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     selectors, overrides = _split_selectors(args.overrides)
+    dataset = args.dataset or selectors.get("dataset", "poisson")
+    model = args.model or selectors.get("model", "l2l")
+    experiment = args.experiment or selectors.get("experiment", "single")
+    if args.multirun:
+        if experiment == "baselines":
+            run_baselines(
+                root=ROOT,
+                dataset=dataset,
+                experiment=experiment,
+                overrides=overrides,
+                limit_samples=args.limit_samples,
+                epochs=args.epochs,
+                output_dir=args.output_dir,
+                device=args.device,
+                overwrite=args.overwrite,
+                dry_run=args.dry_run,
+            )
+            return
+        if experiment == "resolution_sweep":
+            run_resolution_sweep(
+                root=ROOT,
+                dataset=dataset,
+                experiment=experiment,
+                overrides=overrides,
+                limit_samples=args.limit_samples,
+                epochs=args.epochs,
+                output_dir=args.output_dir,
+                device=args.device,
+                overwrite=args.overwrite,
+                dry_run=args.dry_run,
+                include_optional=args.include_optional,
+            )
+            return
+        if experiment in {"poisson_256_seed0", "darcy_256_seed0"}:
+            run_method_study(
+                root=ROOT,
+                dataset=dataset,
+                experiment=experiment,
+                overrides=overrides,
+                limit_samples=args.limit_samples,
+                epochs=args.epochs,
+                output_dir=args.output_dir,
+                device=args.device,
+                overwrite=args.overwrite,
+                dry_run=args.dry_run,
+            )
+            return
+        run_factorial(
+            root=ROOT,
+            dataset=dataset,
+            model=model,
+            experiment=experiment,
+            overrides=overrides,
+            limit_samples=args.limit_samples,
+            epochs=args.epochs,
+            output_dir=args.output_dir,
+            device=args.device,
+            overwrite=args.overwrite,
+            dry_run=args.dry_run,
+        )
+        return
     run_experiment(
-        dataset=args.dataset or selectors.get("dataset", "poisson"),
-        model=args.model or selectors.get("model", "l2l"),
-        experiment=args.experiment or selectors.get("experiment", "single"),
+        dataset=dataset,
+        model=model,
+        experiment=experiment,
         overrides=overrides,
         limit_samples=args.limit_samples,
         epochs=args.epochs,

@@ -1,0 +1,39 @@
+experiment:
+  name: poisson_l2l_refinement_seed0
+  output_dir: results/poisson_l2l_refinement_seed0
+
+baseline:
+  kind: refinement
+  base_model: l2l
+
+base_run_dir: results/poisson_l2l_seed0
+train_base_if_missing: true
+
+refinement:
+  kernel_size: 5
+  hidden_channels: 32
+  num_layers: 4
+  activation: relu
+  residual: false
+  normalize_fields: true
+  normalization_eps: 1.0e-8
+
+training:
+  batch_size: 32
+  eval_batch_size: 256
+  epochs: 25
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  scheduler: reduce_on_plateau
+  patience: 10
+  device: auto
+
+evaluation:
+  metrics:
+    - mse
+    - mae
+    - mre
+    - ssim
+    - interface_jump
+    - poisson_residual
+  save_predictions: true

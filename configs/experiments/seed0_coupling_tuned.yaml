@@ -1,0 +1,33 @@
+experiment:
+  name: poisson_seed0_coupling_tuned
+  seed: 0
+  output_dir: results/seed0_coupling_tuned
+
+mechanisms:
+  two_scale: false
+  coupling: true
+  in_loop_loss: false
+
+pca:
+  solver: randomized
+
+model:
+  coupling:
+    backend: attention
+    embed_dim: 64
+    num_layers: 2
+    attention_heads: 4
+    attention_n_max: 256
+    local_residual: true
+    local_hidden_size: 64
+    local_num_layers: 2
+    zero_init_correction: true
+
+training:
+  epochs: 500
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  scheduler: reduce_on_plateau
+  patience: 30
+  batch_size: 32
+  eval_batch_size: 256

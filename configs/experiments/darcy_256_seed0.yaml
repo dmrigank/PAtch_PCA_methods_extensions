@@ -1,0 +1,72 @@
+experiment:
+  name: darcy_256_seed0
+  seed: 0
+  output_dir: results/darcy_256_seed0
+
+matrix:
+  output_root: results/darcy_256_seed0
+  resolution: 256
+  n_train: 8000
+  seed: 0
+  processed_path: data/processed/darcy_256.npz
+  pca_solver: randomized
+  coarse_factor: 4
+  runs:
+    - name: global_pca
+      model: global_pca
+    - name: plain_l2l
+      model: l2l
+    - name: overlap_l2l
+      model: l2l_overlap
+    - name: fno
+      model: fno
+      config:
+        training:
+          batch_size: 4
+          eval_batch_size: 8
+    - name: two_scale
+      model: l2l
+      mechanisms:
+        two_scale: true
+    - name: two_scale_in_loop
+      model: l2l
+      mechanisms:
+        two_scale: true
+        in_loop_loss: true
+      warm_start_from: two_scale
+      config:
+        training:
+          epochs: 50
+          lr: 1.0e-4
+          weight_decay: 0.0
+          scheduler: none
+        loss:
+          reconstruction: relative_l2
+          interface_target: truth
+          pde: darcy
+          active_terms:
+            - recon
+            - interface_value
+            - interface_flux
+            - spectral
+          weights:
+            recon: 1.0
+            interface_value: 5.0
+            interface_flux: 0.05
+            pde_residual: 0.0
+            spectral: 0.02
+          warmup:
+            reconstruction_epochs: 3
+            ramp_epochs: 10
+
+evaluation:
+  metrics:
+    - mse
+    - mae
+    - mre
+    - ssim
+    - relative_spectrum_error
+    - interface_jump
+    - interface_flux_jump
+    - darcy_residual
+  save_predictions: true

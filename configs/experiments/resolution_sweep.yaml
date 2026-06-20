@@ -1,8 +1,27 @@
 experiment:
   name: resolution_sweep
   seed: 0
+  output_dir: results/resolution_sweep
 
 matrix:
-  resolutions: [64, 128, 256]
-  models: [l2l, l2l_overlap, full]
+  output_root: results/resolution_sweep
+  n_samples: 8000
+  main:
+    resolutions: [64, 128, 256]
+    models: [l2l, l2l_overlap, full]
+    coarse_factor: 4
+  optional:
+    enabled: false
+    resolutions: [512]
+    models: [l2l, full]
+    coarse_factor: 8
   seeds: [0, 1, 2, 3, 4]
+
+data_cache:
+  root: data/processed
+  deterministic: true
+  key_fields:
+    - dataset.name
+    - dataset.grid_size
+    - matrix.n_samples
+    - experiment.seed

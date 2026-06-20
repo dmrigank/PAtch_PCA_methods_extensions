@@ -70,6 +70,8 @@ def _broadcast_field(array: np.ndarray, shape: tuple[int, int, int], name: str) 
         return np.full(shape, float(array), dtype=np.float64)
     if array.ndim == 2:
         array = np.broadcast_to(array[None, :, :], shape)
+    if array.ndim == 3 and array.shape[1:] == (1, 1) and array.shape[0] == shape[0]:
+        array = np.broadcast_to(array, shape)
     if array.shape != shape:
         raise ValueError(f"{name} must be broadcastable to {shape}, got {array.shape}.")
     return array

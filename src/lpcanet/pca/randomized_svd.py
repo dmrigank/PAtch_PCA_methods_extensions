@@ -100,13 +100,17 @@ def _fit_adaptive_randomized_pca(
     growth_factor: float = 1.5,
 ) -> PCA:
     """Fit a PCA-compatible object by adaptively increasing randomized SVD rank."""
-    matrix = np.asarray(data, dtype=np.float64)
+    input_array = np.asarray(data)
+    if input_array.dtype == np.float32:
+        matrix = np.asarray(input_array, dtype=np.float32)
+    else:
+        matrix = np.asarray(input_array, dtype=np.float64)
     if matrix.ndim != 2:
         raise ValueError(f"PCA expects a 2D matrix, got shape {matrix.shape}.")
     n_samples, n_features = matrix.shape
     mean = np.mean(matrix, axis=0)
     centered = matrix - mean
-    total_variance = float(np.sum(centered * centered))
+    total_variance = float(np.sum(centered * centered, dtype=np.float64))
     max_rank = min(n_samples, n_features)
     if max_rank <= 1 or total_variance <= 0.0:
         return make_pca(variance_threshold, solver="full").fit(matrix)

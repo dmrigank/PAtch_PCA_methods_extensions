@@ -5,6 +5,10 @@ dataset:
     - a
   output_key: u
   grid_size: 128
+  constant_forcing: 1.0
+
+loss:
+  pde: darcy
 
 evaluation:
   metrics:
@@ -14,4 +18,5 @@ evaluation:
     - ssim
     - relative_spectrum_error
     - interface_jump
+    - interface_flux_jump
     - darcy_residual

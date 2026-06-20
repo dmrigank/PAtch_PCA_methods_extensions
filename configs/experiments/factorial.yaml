@@ -1,8 +1,11 @@
 experiment:
   name: factorial
   seed: 0
+  output_dir: results/factorial
 
 matrix:
+  output_root: results/factorial
+  resolutions: [128]
   mechanisms:
     two_scale: [false, true]
     coupling: [false, true]

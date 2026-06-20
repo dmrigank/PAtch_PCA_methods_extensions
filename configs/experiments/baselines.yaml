@@ -1,16 +1,16 @@
 experiment:
   name: baselines
   seed: 0
+  output_dir: results/baselines
 
 matrix:
+  output_root: results/baselines
+  resolutions: [128]
   models:
     - global_pca
     - l2g
     - l2l
     - l2l_overlap
     - l2l_refinement
-    - mgtfno_rank_0p10
-    - mgtfno_rank_0p25
-    - mgtfno_rank_0p50
     - fno
   seeds: [0, 1, 2, 3, 4]

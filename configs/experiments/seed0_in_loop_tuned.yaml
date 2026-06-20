@@ -1,0 +1,45 @@
+experiment:
+  name: poisson_seed0_in_loop_tuned
+  seed: 0
+  output_dir: results/seed0_in_loop_tuned
+
+mechanisms:
+  two_scale: false
+  coupling: false
+  in_loop_loss: true
+
+warm_start:
+  enabled: true
+  run_dir: results/factorial/resolution_128/two_scale-off__coupling-off__in_loop_loss-off/seed_0
+
+pca:
+  solver: randomized
+
+training:
+  epochs: 50
+  lr: 1.0e-4
+  weight_decay: 0.0
+  scheduler: none
+  batch_size: 32
+  eval_batch_size: 256
+
+loss:
+  reconstruction: relative_l2
+  interface_target: truth
+  active_terms:
+    - recon
+    - interface_value
+    - interface_flux
+    - spectral
+  weights:
+    recon: 1.0
+    interface_value: 5.0
+    interface_flux: 0.05
+    pde_residual: 0.0
+    spectral: 0.02
+  warmup:
+    reconstruction_epochs: 3
+    ramp_epochs: 10
+  pde: poisson
+  pde_reduction: rms
+  spectral_high_k_weight_power: 1.0

@@ -80,13 +80,12 @@ def assemble_patches_2d(
     """Assemble patches into fields using average overlap handling."""
     if mode != "average":
         raise ValueError(f"Unsupported assembly mode {mode!r}; expected 'average'.")
-    weights = np.ones((patch_size, patch_size), dtype=np.float64)
     return assemble_weighted_patches_2d(
         patches,
         grid_shape,
         patch_size,
         stride,
-        weights,
+        np.ones((patch_size, patch_size), dtype=np.float64),
         include_edges=include_edges,
     )
 
@@ -101,6 +100,8 @@ def assemble_weighted_patches_2d(
     include_edges: bool = False,
 ) -> np.ndarray:
     """Assemble patches into fields using a per-patch 2D weight matrix."""
+    from lpcanet.assembly.mosaic import assemble_mosaic_numpy
+
     height, width = _validate_grid_shape(grid_shape)
     slices = get_patch_slices((height, width), patch_size, stride, include_edges=include_edges)
     patches_4d = _as_unflattened_patches(patches, patch_size)
@@ -120,23 +121,14 @@ def assemble_weighted_patches_2d(
     if np.any(weights < 0):
         raise ValueError("weights must be nonnegative.")
 
-    fields = np.zeros((patches_4d.shape[0], height, width), dtype=np.float64)
-    weight_sums = np.zeros((height, width), dtype=np.float64)
-    for patch_index, (row_slice, col_slice) in enumerate(slices):
-        weighted_patch = patches_4d[:, patch_index].astype(np.float64, copy=False) * weights
-        fields[:, row_slice, col_slice] += weighted_patch
-        weight_sums[row_slice, col_slice] += weights
-
-    if np.any(weight_sums <= 0):
-        zero_count = int(np.count_nonzero(weight_sums <= 0))
-        raise ValueError(
-            "Patch weights leave uncovered or zero-weight pixels "
-            f"({zero_count} pixels). Use nonzero boundary weights, uniform averaging, "
-            "or an explicit boundary policy."
-        )
-
-    fields /= weight_sums[None, :, :]
-    return fields.astype(patches_4d.dtype, copy=False)
+    return assemble_mosaic_numpy(
+        patches_4d,
+        (height, width),
+        patch_size,
+        stride,
+        weights,
+        include_edges=include_edges,
+    )
 
 
 def _as_unflattened_patches(patches: np.ndarray, patch_size: int) -> np.ndarray:

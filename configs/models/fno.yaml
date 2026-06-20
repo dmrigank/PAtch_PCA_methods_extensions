@@ -1,0 +1,44 @@
+experiment:
+  name: poisson_fno_seed0
+  output_dir: results/poisson_fno_seed0
+
+pca:
+  type: none
+
+model:
+  type: fno
+  fno:
+    in_channels: 1
+    out_channels: 1
+    width: 32
+    modes: 12
+    num_layers: 4
+    hidden_size: 128
+    padding: 8
+  normalization:
+    enabled: true
+    eps: 1.0e-8
+
+training:
+  batch_size: 16
+  eval_batch_size: 64
+  epochs: 100
+  lr: 1.0e-3
+  weight_decay: 0.0
+  scheduler: reduce_on_plateau
+  patience: 5
+  early_stopping:
+    enabled: true
+    patience: 15
+    min_delta: 0.0
+  device: auto
+
+evaluation:
+  metrics:
+    - mse
+    - mae
+    - mre
+    - ssim
+    - relative_spectrum_error
+    - poisson_residual
+  save_predictions: true

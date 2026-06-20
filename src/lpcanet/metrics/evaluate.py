@@ -11,7 +11,7 @@ from typing import Any
 import numpy as np
 
 from lpcanet.data.io import load_npz
-from lpcanet.metrics.interface import interface_jump
+from lpcanet.metrics.interface import interface_flux_jump, interface_jump
 from lpcanet.metrics.metrics import aggregate_metrics
 from lpcanet.metrics.residuals import darcy_residual, poisson_residual
 from lpcanet.metrics.spectral import relative_spectrum_error
@@ -39,6 +39,7 @@ def evaluate_run(run_dir: str | Path) -> dict[str, float]:
         metrics["relative_spectrum_error"] = relative_spectrum_error(pred, true)
 
     patches = config.get("patches", {})
+    dx = _resolve_dx(config, pred.shape[-1])
     if patches and ("interface_jump" in requested or "interface_jump_mean" in requested):
         metrics["interface_jump"] = interface_jump(
             pred,
@@ -46,8 +47,15 @@ def evaluate_run(run_dir: str | Path) -> dict[str, float]:
             stride=int(patches["stride"]),
             include_edges=bool(patches.get("include_edges", False)),
         )
+    if patches and "interface_flux_jump" in requested:
+        metrics["interface_flux_jump"] = interface_flux_jump(
+            pred,
+            patch_size=int(patches["patch_size"]),
+            stride=int(patches["stride"]),
+            dx=dx,
+            include_edges=bool(patches.get("include_edges", False)),
+        )
 
-    dx = _resolve_dx(config, pred.shape[-1])
     dataset_name = str(config.get("dataset", {}).get("name", "")).lower()
     if "poisson_residual" in requested and dataset_name == "poisson" and "x_input" in predictions:
         residual = poisson_residual(pred, predictions["x_input"], dx)

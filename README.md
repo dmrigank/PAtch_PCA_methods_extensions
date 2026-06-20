@@ -47,6 +47,11 @@ Requires Python 3.10+, PyTorch, NumPy, SciPy.
 # 1. generate a dataset (cached, deterministic)
 python scripts/generate_data.py dataset=poisson resolution=128
 
+# Generate the 10,000-sample Poisson dataset used by the 256-grid sweep
+conda run -n DiffusionPDE python scripts/generate_data.py \
+  dataset=poisson resolution=256 n_samples=10000 seed=0 batch_size=32 \
+  output=data/processed/poisson_256.npz
+
 # 2. train the full model
 python scripts/run_experiment.py model=full dataset=poisson resolution=128 seed=0
 
@@ -64,6 +69,18 @@ python scripts/make_figures.py
 
 Resolutions **64 / 128 / 256** (128 primary), $m = 8000$ samples, 99% retained
 variance.
+
+The generators preserve the prior paper's GRF and PDE conventions and write
+deterministic 80/10/10 splits. A 10,000-sample 256-grid dataset containing two
+float32 fields is about 4.9 GiB; generation temporarily requires about 9.8 GiB
+while the final NPZ is assembled. Compression is optional but substantially
+slower. For Darcy, a short timing pilot can be run before the full generation:
+
+```bash
+conda run -n DiffusionPDE python scripts/generate_data.py \
+  dataset=darcy resolution=256 n_samples=100 seed=0 batch_size=16 \
+  output=data/processed/darcy_256_pilot.npz
+```
 
 ## Reproducing the paper
 

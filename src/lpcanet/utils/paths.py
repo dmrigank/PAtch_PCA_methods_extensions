@@ -35,6 +35,14 @@ def ensure_dir(path: str | Path) -> Path:
     return directory
 
 
+def run_dir_has_artifacts(path: str | Path) -> bool:
+    """Return whether a run directory contains outputs beyond resolved config files."""
+    directory = normalize_path(path)
+    if not directory.exists():
+        return False
+    return any(entry.name != "resolved_configs" for entry in directory.iterdir())
+
+
 def require_nonexistent_or_empty(path: str | Path, *, overwrite: bool = False) -> Path:
     """Validate an output directory without deleting existing data.
 

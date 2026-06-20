@@ -14,6 +14,10 @@ pca:
   output_variance: 0.99
   solver: full
   standardize: true
+  two_scale:
+    coarse_factor: 4
+    coarse_components: 20
+    coarse_variance: 0.99
   randomized:
     oversampling: 20
     n_iter: 4
@@ -29,6 +33,17 @@ model:
   num_layers: 4
   activation: relu
   dropout: 0.0
+  coupling:
+    backend: gnn
+    embed_dim: 128
+    num_layers: 3
+    neighborhood: 8
+    attention_heads: 4
+    attention_n_max: 256
+    local_residual: false
+    local_hidden_size: 64
+    local_num_layers: 2
+    zero_init_correction: false
 
 training:
   batch_size: 32
@@ -40,6 +55,28 @@ training:
   patience: 30
   device: auto
 
+loss:
+  reconstruction: relative_l2
+  interface_target: zero
+  active_terms:
+    - recon
+    - interface_value
+    - interface_flux
+    - pde_residual
+    - spectral
+  weights:
+    recon: 1.0
+    interface_value: 0.05
+    interface_flux: 1.0e-3
+    pde_residual: 1.0e-6
+    spectral: 0.05
+  warmup:
+    reconstruction_epochs: 10
+    ramp_epochs: 40
+  pde: poisson
+  pde_reduction: rms
+  spectral_high_k_weight_power: 1.0
+
 evaluation:
   metrics:
     - mse
@@ -48,5 +85,6 @@ evaluation:
     - ssim
     - relative_spectrum_error
     - interface_jump
+    - interface_flux_jump
     - poisson_residual
   save_predictions: true

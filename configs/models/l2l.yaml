@@ -6,8 +6,8 @@ pca:
   type: local_to_local
 
 patches:
-  patch_size: 32
-  stride: 32
+  patch_size: 64
+  stride: 64
   assembly: average
 
 model:

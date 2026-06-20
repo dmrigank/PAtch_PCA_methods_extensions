@@ -8,15 +8,17 @@ from typing import Any
 
 import joblib
 import numpy as np
+import torch
 from sklearn.preprocessing import StandardScaler
 
+from lpcanet.assembly.operators import prolongate_bilinear, restrict_average
 from lpcanet.assembly.patching import (
     assemble_patches_2d,
     assemble_weighted_patches_2d,
     extract_patches_2d,
     get_patch_slices,
 )
-from lpcanet.pca.randomized_svd import fit_pca
+from lpcanet.pca.randomized_svd import fit_pca, truncate_pca_to_variance
 from lpcanet.utils.paths import normalize_path
 
 
@@ -416,6 +418,217 @@ class LocalToLocalPCAEncoder(BasePCAEncoder):
         return result.astype(np.float32, copy=False)
 
 
+class TwoScaleLocalToLocalPCAEncoder(LocalToLocalPCAEncoder):
+    """Local input PCA with two-scale coarse-global plus local-residual output PCA."""
+
+    def __init__(
+        self,
+        patch_size: int,
+        stride: int,
+        input_variance: int | float = 0.99,
+        output_variance: int | float = 0.99,
+        solver: str = "full",
+        standardize: bool = True,
+        oversampling: int = 20,
+        n_iter: int = 4,
+        random_state: int | None = None,
+        assembly_weights: np.ndarray | None = None,
+        include_edges: bool = False,
+        coarse_factor: int = 4,
+        coarse_components: int = 20,
+        coarse_variance: float = 0.99,
+        grid_size: int | None = None,
+        n_samples: int | None = None,
+    ) -> None:
+        super().__init__(
+            patch_size=patch_size,
+            stride=stride,
+            input_variance=input_variance,
+            output_variance=output_variance,
+            solver=solver,
+            standardize=standardize,
+            oversampling=oversampling,
+            n_iter=n_iter,
+            random_state=random_state,
+            assembly_weights=assembly_weights,
+            include_edges=include_edges,
+        )
+        if coarse_factor <= 0:
+            raise ValueError("coarse_factor must be positive.")
+        if coarse_components <= 0:
+            raise ValueError("coarse_components must be positive.")
+        if not 0.0 < coarse_variance <= 1.0:
+            raise ValueError("coarse_variance must be in (0, 1].")
+        self.coarse_factor = int(coarse_factor)
+        self.coarse_components = int(coarse_components)
+        self.coarse_variance = float(coarse_variance)
+        if grid_size is not None and n_samples is not None:
+            _validate_coarse_factor(
+                (int(grid_size), int(grid_size)),
+                int(n_samples),
+                self.coarse_factor,
+            )
+
+    def fit(self, x_train: np.ndarray, y_train: np.ndarray) -> TwoScaleLocalToLocalPCAEncoder:
+        """Fit local input PCA, coarse output PCA, and residual patch output PCA."""
+        self.grid_shape = _field_grid_shape(x_train)
+        self.output_shape_ = _field_grid_shape(y_train)
+        if self.grid_shape != self.output_shape_:
+            raise ValueError(
+                f"Input/output grids must match for two-scale L2L PCA, got "
+                f"{self.grid_shape} and {self.output_shape_}."
+            )
+        _validate_coarse_factor(self.output_shape_, int(y_train.shape[0]), self.coarse_factor)
+        self.patch_slices = get_patch_slices(
+            self.grid_shape,
+            self.patch_size,
+            self.stride,
+            include_edges=self.include_edges,
+        )
+        x_patches = extract_patches_2d(
+            x_train,
+            self.patch_size,
+            self.stride,
+            flatten=True,
+            include_edges=self.include_edges,
+        )
+
+        start = perf_counter()
+        self.input_models = _fit_patch_models(self, x_patches, self.input_variance)
+        self.timings["fit_input_pca"] = perf_counter() - start
+
+        start = perf_counter()
+        y_coarse_flat = _flatten_coarse_fields(
+            _restrict_fields_numpy(y_train, self.coarse_factor)
+        )
+        self.coarse_scaler = self._new_scaler()
+        y_coarse_scaled = self.coarse_scaler.fit_transform(y_coarse_flat)
+        self.coarse_pca = fit_pca(
+            y_coarse_scaled,
+            min(self.coarse_components, min(y_coarse_scaled.shape) - 1),
+            solver="randomized",
+            oversampling=self.oversampling,
+            n_iter=self.n_iter,
+            random_state=self.random_state,
+        )
+        self.coarse_pca = truncate_pca_to_variance(self.coarse_pca, self.coarse_variance)
+        self.timings["fit_coarse_svd"] = perf_counter() - start
+
+        start = perf_counter()
+        coarse_latent = self.coarse_pca.transform(y_coarse_scaled)
+        coarse_recon = self._coarse_inverse_transform(coarse_latent)
+        residual = np.asarray(y_train, dtype=np.float64) - coarse_recon
+        residual_patches = extract_patches_2d(
+            residual,
+            self.patch_size,
+            self.stride,
+            flatten=True,
+            include_edges=self.include_edges,
+        )
+        self.output_models = _fit_patch_models(self, residual_patches, self.output_variance)
+        self.timings["fit_output_residual_pca"] = perf_counter() - start
+        self.timings["fit_output_pca"] = (
+            self.timings["fit_coarse_svd"] + self.timings["fit_output_residual_pca"]
+        )
+
+        input_counts = [int(model["pca"].n_components_) for model in self.input_models]
+        output_counts = [int(model["pca"].n_components_) for model in self.output_models]
+        coarse_count = int(self.coarse_pca.n_components_)
+        self.component_counts = {
+            "input_patches": input_counts,
+            "input_total": int(sum(input_counts)),
+            "coarse_output": coarse_count,
+            "output_patches": output_counts,
+            "output_residual_total": int(sum(output_counts)),
+            "output_total": int(coarse_count + sum(output_counts)),
+        }
+        self.is_fitted = True
+        return self
+
+    def transform_outputs(self, y: np.ndarray) -> np.ndarray:
+        """Transform fields to coarse-global plus residual-patch coordinates."""
+        self._require_fitted()
+        _check_field_shape(y, self.output_shape_, name="y")
+        start = perf_counter()
+        y_coarse_flat = _flatten_coarse_fields(_restrict_fields_numpy(y, self.coarse_factor))
+        coarse_latent = self.coarse_pca.transform(self.coarse_scaler.transform(y_coarse_flat))
+        coarse_recon = self._coarse_inverse_transform(coarse_latent)
+        residual = np.asarray(y, dtype=np.float64) - coarse_recon
+        residual_patches = extract_patches_2d(
+            residual,
+            self.patch_size,
+            self.stride,
+            flatten=True,
+            include_edges=self.include_edges,
+        )
+        residual_latent = _transform_patch_models(residual_patches, self.output_models)
+        result = np.concatenate([coarse_latent, residual_latent], axis=1)
+        self.timings["transform_outputs"] = self.timings.get("transform_outputs", 0.0) + (
+            perf_counter() - start
+        )
+        return result.astype(np.float32, copy=False)
+
+    def inverse_transform_outputs(self, z: np.ndarray) -> np.ndarray:
+        """Decode coarse coordinates plus residual patch coordinates to fields."""
+        start = perf_counter()
+        coarse, residual = self.decompose_outputs(z)
+        result = coarse.astype(np.float64, copy=False) + residual.astype(
+            np.float64, copy=False
+        )
+        self.timings["inverse_transform_outputs"] = self.timings.get(
+            "inverse_transform_outputs", 0.0
+        ) + (perf_counter() - start)
+        return result.astype(np.float32, copy=False)
+
+    def decompose_outputs(self, z: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Decode latent outputs into global-coarse and local-residual fields."""
+        self._require_fitted()
+        z = np.asarray(z)
+        coarse_components = int(self.coarse_pca.n_components_)
+        if z.shape[1] < coarse_components:
+            raise ValueError(
+                f"Latent output has too few columns for coarse code: "
+                f"needed {coarse_components}, got {z.shape[1]}."
+            )
+
+        coarse = self._coarse_inverse_transform(z[:, :coarse_components])
+        residual_z = z[:, coarse_components:]
+        residual_patches = _inverse_patch_models(residual_z, self.output_models, self.patch_size)
+        if self.assembly_weights is None:
+            residual = assemble_patches_2d(
+                residual_patches,
+                self.output_shape_,
+                self.patch_size,
+                self.stride,
+                mode="average",
+                include_edges=self.include_edges,
+            )
+        else:
+            residual = assemble_weighted_patches_2d(
+                residual_patches,
+                self.output_shape_,
+                self.patch_size,
+                self.stride,
+                self.assembly_weights,
+                include_edges=self.include_edges,
+            )
+        return (
+            coarse.astype(np.float32, copy=False),
+            residual.astype(np.float32, copy=False),
+        )
+
+    def _coarse_inverse_transform(self, coarse_latent: np.ndarray) -> np.ndarray:
+        coarse_scaled = self.coarse_pca.inverse_transform(np.asarray(coarse_latent))
+        coarse_flat = self.coarse_scaler.inverse_transform(coarse_scaled)
+        coarse_shape = (
+            coarse_flat.shape[0],
+            self.output_shape_[0] // self.coarse_factor,
+            self.output_shape_[1] // self.coarse_factor,
+        )
+        coarse_fields = coarse_flat.reshape(coarse_shape)
+        return _prolongate_fields_numpy(coarse_fields, self.coarse_factor)
+
+
 def _fit_patch_models(
     encoder: BasePCAEncoder,
     patches: np.ndarray,
@@ -491,3 +704,41 @@ def _check_field_shape(fields: np.ndarray, expected: tuple[int, int], name: str)
     fields = np.asarray(fields)
     if fields.ndim != 3 or tuple(fields.shape[1:]) != expected:
         raise ValueError(f"{name} must have shape (N, {expected[0]}, {expected[1]}), got {fields.shape}.")
+
+
+def _validate_coarse_factor(
+    grid_shape: tuple[int, int],
+    n_samples: int,
+    coarse_factor: int,
+) -> None:
+    height, width = int(grid_shape[0]), int(grid_shape[1])
+    if height != width:
+        raise ValueError(f"Two-scale output requires square grids, got {grid_shape}.")
+    if height % coarse_factor != 0 or width % coarse_factor != 0:
+        raise ValueError(
+            f"Grid shape {grid_shape} must be divisible by coarse_factor={coarse_factor}."
+        )
+    coarse_features = (height // coarse_factor) * (width // coarse_factor)
+    if coarse_features >= n_samples:
+        raise ValueError(
+            "Coarse factor invariant violated: "
+            f"(D/c)^2={coarse_features} must be < m={n_samples}. "
+            "Increase pca.two_scale.coarse_factor for this resolution/sample count."
+        )
+
+
+def _restrict_fields_numpy(fields: np.ndarray, factor: int) -> np.ndarray:
+    tensor = torch.as_tensor(np.asarray(fields), dtype=torch.float64)
+    return restrict_average(tensor, factor=factor).detach().cpu().numpy()
+
+
+def _prolongate_fields_numpy(fields: np.ndarray, factor: int) -> np.ndarray:
+    tensor = torch.as_tensor(np.asarray(fields), dtype=torch.float64)
+    return prolongate_bilinear(tensor, factor=factor).detach().cpu().numpy()
+
+
+def _flatten_coarse_fields(fields: np.ndarray) -> np.ndarray:
+    fields = np.asarray(fields)
+    if fields.ndim != 3:
+        raise ValueError(f"Expected coarse fields with shape (N, H, W), got {fields.shape}.")
+    return fields.reshape(fields.shape[0], -1)
