@@ -1,0 +1,23 @@
+experiment:
+  name: poisson_coupling_gat_seed0
+  output_dir: results/coupling_gat_seed0
+
+pca:
+  type: local_to_local
+
+patches:
+  patch_size: 32
+  stride: 32
+  assembly: average
+
+mechanisms:
+  coupling: true
+
+model:
+  coupling:
+    backend: gat
+    embed_dim: 64
+    num_layers: 3
+    attention_heads: 4
+    neighborhood: 8
+    gat_negative_slope: 0.2

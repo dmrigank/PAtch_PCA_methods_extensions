@@ -531,12 +531,18 @@ def _make_model(
             local_hidden_size=int(coupling_cfg.get("local_hidden_size", 64)),
             local_num_layers=int(coupling_cfg.get("local_num_layers", 2)),
             zero_init_correction=bool(coupling_cfg.get("zero_init_correction", False)),
+            gat_negative_slope=float(coupling_cfg.get("gat_negative_slope", 0.2)),
         )
         if model.input_dim != input_dim or model.output_dim != output_dim:
             raise ValueError(
                 f"Coupling model dimensions {model.input_dim}->{model.output_dim} "
                 f"do not match training data {input_dim}->{output_dim}."
             )
+        print(
+            f"[_make_model] CouplingOperator backend={model.backend!r} "
+            f"({type(model.backend_module).__name__}) "
+            f"patches={model.num_patches} embed_dim={model.embed_dim}"
+        )
         return model
 
     if model_type in {"mlp", "pca_net"}:

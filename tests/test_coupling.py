@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from lpcanet.metrics import mre
-from lpcanet.models.coupling import CouplingOperator
+from lpcanet.models.coupling import CouplingOperator, GATCouplingBackend
 from lpcanet.models.mlp import MLP
 from lpcanet.pca.pca import LocalToLocalPCAEncoder
 from lpcanet.train.loop import predict_latent, train_latent_model
@@ -66,6 +66,75 @@ def test_attention_guardrail_asserts_above_n_max() -> None:
         )
 
 
+def test_gat_backend_shape_and_gradient() -> None:
+    torch.manual_seed(1)
+    input_counts = [2, 3, 1, 4]
+    output_counts = [1, 2, 3, 1]
+    x = torch.randn(5, sum(input_counts), requires_grad=True)
+
+    # Single-head GAT, with global_output_dim to exercise that path too.
+    gat_single = CouplingOperator(
+        input_component_counts=input_counts,
+        output_component_counts=output_counts,
+        grid_shape=(2, 2),
+        embed_dim=8,
+        backend="gat",
+        num_layers=2,
+        attention_heads=1,
+        neighborhood=4,
+        global_output_dim=3,
+    )
+    y = gat_single(x)
+    assert tuple(y.shape) == (5, 3 + sum(output_counts)), f"unexpected shape {tuple(y.shape)}"
+    y.square().mean().backward()
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all(), "non-finite gradients in single-head GAT"
+
+    # Multi-head GAT (4 heads), 8-neighbor graph.
+    x2 = torch.randn(3, sum(input_counts), requires_grad=True)
+    gat_multi = CouplingOperator(
+        input_component_counts=input_counts,
+        output_component_counts=output_counts,
+        grid_shape=(2, 2),
+        embed_dim=8,
+        backend="gat",
+        num_layers=3,
+        attention_heads=4,
+        neighborhood=8,
+        dropout=0.0,
+        gat_negative_slope=0.1,
+    )
+    y2 = gat_multi(x2)
+    assert tuple(y2.shape) == (3, sum(output_counts)), f"unexpected shape {tuple(y2.shape)}"
+    y2.square().mean().backward()
+    assert x2.grad is not None
+    assert torch.isfinite(x2.grad).all(), "non-finite gradients in multi-head GAT"
+
+
+def test_gat_embed_dim_not_divisible_by_heads_raises() -> None:
+    with pytest.raises(ValueError, match="divisible by attention_heads"):
+        CouplingOperator(
+            input_component_counts=[2, 3, 1, 4],
+            output_component_counts=[1, 2, 3, 1],
+            grid_shape=(2, 2),
+            embed_dim=9,
+            backend="gat",
+            attention_heads=4,
+        )
+
+
+def test_gat_backend_module_is_gat_coupling_backend() -> None:
+    op = CouplingOperator(
+        input_component_counts=[2, 2],
+        output_component_counts=[2, 2],
+        grid_shape=(1, 2),
+        embed_dim=8,
+        backend="gat",
+        attention_heads=2,
+    )
+    assert isinstance(op.backend_module, GATCouplingBackend)
+
+
 def test_coupling_poisson128_run_improves_mre_over_plain_l2l() -> None:
     set_seed(4)
     x, y = _make_neighbor_coupled_poisson128(n_samples=96)
@@ -98,18 +167,26 @@ def test_coupling_poisson128_run_improves_mre_over_plain_l2l() -> None:
         test_slice,
     )
     counts = encoder.component_counts
-    coupling_pred = _train_and_predict(
-        CouplingOperator(
-            input_component_counts=[int(value) for value in counts["input_patches"]],
-            output_component_counts=[int(value) for value in counts["output_patches"]],
-            grid_shape=(4, 4),
-            embed_dim=32,
-            backend="gnn",
-            num_layers=2,
-            attention_heads=4,
-            attention_n_max=256,
-            neighborhood=8,
-        ),
+    _shared_coupling_kwargs = dict(
+        input_component_counts=[int(value) for value in counts["input_patches"]],
+        output_component_counts=[int(value) for value in counts["output_patches"]],
+        grid_shape=(4, 4),
+        embed_dim=32,
+        num_layers=2,
+        attention_heads=4,
+        attention_n_max=256,
+        neighborhood=8,
+    )
+    gnn_pred = _train_and_predict(
+        CouplingOperator(backend="gnn", **_shared_coupling_kwargs),
+        x_latent,
+        y_latent,
+        train_slice,
+        val_slice,
+        test_slice,
+    )
+    gat_pred = _train_and_predict(
+        CouplingOperator(backend="gat", **_shared_coupling_kwargs),
         x_latent,
         y_latent,
         train_slice,
@@ -119,8 +196,10 @@ def test_coupling_poisson128_run_improves_mre_over_plain_l2l() -> None:
 
     true_fields = y[test_slice]
     plain_mre = mre(encoder.inverse_transform_outputs(plain_pred), true_fields)
-    coupling_mre = mre(encoder.inverse_transform_outputs(coupling_pred), true_fields)
-    assert coupling_mre < plain_mre
+    gnn_mre = mre(encoder.inverse_transform_outputs(gnn_pred), true_fields)
+    gat_mre = mre(encoder.inverse_transform_outputs(gat_pred), true_fields)
+    assert gnn_mre < plain_mre, f"GNN ({gnn_mre:.4f}) did not beat MLP ({plain_mre:.4f})"
+    assert gat_mre < plain_mre, f"GAT ({gat_mre:.4f}) did not beat MLP ({plain_mre:.4f})"
 
 
 def _train_and_predict(
