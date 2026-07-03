@@ -22,6 +22,15 @@ __pycache__/
 build/
 dist/
 
+# Generated figures and checkpoints
+*.png
+*.ckpt
+logs/
+
+# Environment files
+.env
+*.env
+
 # Local/editor/runtime files
 .DS_Store
 *.pyc
