@@ -1,0 +1,129 @@
+experiment:
+  name: boundary_correction_sweep
+  seed: 0
+  output_dir: results/boundary_correction_sweep
+
+training:
+  epochs: 200
+  batch_size: 32
+  eval_batch_size: 64
+  device: mps
+  correction_heads_lr: 1.0e-4
+
+loss:
+  interface_target: truth
+  weights:
+    pde_residual: 0.0
+    spectral: 0.02
+  warmup:
+    reconstruction_epochs: 3
+    ramp_epochs: 10
+
+matrix:
+  output_root: results/boundary_correction_sweep
+  resolution: 128
+  n_train: 8000
+  seed: 0
+  processed_path: data/processed/darcy_128.npz
+  pca_solver: randomized
+  coarse_factor: 4
+  runs:
+    - name: iv5_if005
+      model: boundary_correction_gnn
+      mechanisms:
+        in_loop_loss: true
+      config:
+        loss:
+          active_terms:
+            - recon
+            - interface_value
+            - interface_flux
+          weights:
+            interface_value: 5.0
+            interface_flux: 0.05
+
+    - name: iv10_if010
+      model: boundary_correction_gnn
+      mechanisms:
+        in_loop_loss: true
+      config:
+        loss:
+          active_terms:
+            - recon
+            - interface_value
+            - interface_flux
+          weights:
+            interface_value: 10.0
+            interface_flux: 0.1
+
+    - name: iv20_if020
+      model: boundary_correction_gnn
+      mechanisms:
+        in_loop_loss: true
+      config:
+        loss:
+          active_terms:
+            - recon
+            - interface_value
+            - interface_flux
+          weights:
+            interface_value: 20.0
+            interface_flux: 0.2
+
+    - name: iv5_if050
+      model: boundary_correction_gnn
+      mechanisms:
+        in_loop_loss: true
+      config:
+        loss:
+          active_terms:
+            - recon
+            - interface_value
+            - interface_flux
+            - spectral
+          weights:
+            interface_value: 5.0
+            interface_flux: 0.5
+
+    - name: iv5_if100
+      model: boundary_correction_gnn
+      mechanisms:
+        in_loop_loss: true
+      config:
+        loss:
+          active_terms:
+            - recon
+            - interface_value
+            - interface_flux
+            - spectral
+          weights:
+            interface_value: 5.0
+            interface_flux: 1.0
+
+    - name: iv5_if100_recon05
+      model: boundary_correction_gnn
+      mechanisms:
+        in_loop_loss: true
+      config:
+        loss:
+          active_terms:
+            - recon
+            - interface_value
+            - interface_flux
+            - spectral
+          weights:
+            recon: 0.5
+            interface_value: 5.0
+            interface_flux: 1.0
+
+evaluation:
+  metrics:
+    - mse
+    - mae
+    - mre
+    - ssim
+    - relative_spectrum_error
+    - interface_jump
+    - interface_flux_jump
+    - darcy_residual
+  save_predictions: true
