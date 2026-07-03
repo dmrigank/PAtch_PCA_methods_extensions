@@ -15,6 +15,7 @@ import torch
 from lpcanet.assembly.windows import hann2d, safe_hann2d
 from lpcanet.data.io import load_npz, save_npz
 from lpcanet.data.splits import make_splits
+from lpcanet.models.boundary_correction import BoundaryCorrectionGNN, PassthroughDecoder
 from lpcanet.models.coupling import CouplingOperator
 from lpcanet.models.fno import FNO2d
 from lpcanet.models.mlp import MLP, count_parameters
@@ -147,12 +148,14 @@ def train_from_config(
         x_test_latent = encoder.transform_inputs(x_test)
 
     model_cfg = config.setdefault("model", {})
+    boundary_correction_enabled = bool(config.get("mechanisms", {}).get("boundary_correction", False))
     model = _make_model(
         model_cfg,
         encoder,
         input_dim=int(x_train_latent.shape[1]),
         output_dim=int(y_train_latent.shape[1]),
         coupling_enabled=bool(config.get("mechanisms", {}).get("coupling", False)),
+        boundary_correction_enabled=boundary_correction_enabled,
     )
     if warm_start_dir is not None:
         state_dict = torch.load(
@@ -167,9 +170,28 @@ def train_from_config(
         if in_loop_loss:
             loss_config = _make_in_loop_loss_config(config, y_train.shape[-1])
             forcing_all, coefficient_all = _select_pde_arrays(data, x_all, loss_config["pde"])
+            # BoundaryCorrectionGNN returns field directly; use PassthroughDecoder
+            field_decoder = PassthroughDecoder() if boundary_correction_enabled else TorchPCADecoder(encoder)
+            # Per-group LR: correction_heads optionally get a separate (lower) lr
+            _lr = float(training_cfg.get("lr", 1e-3))
+            _wd = float(training_cfg.get("weight_decay", 1e-4))
+            _corr_lr_raw = training_cfg.get("correction_heads_lr")
+            _loop_optimizer: torch.optim.Optimizer | None = None
+            if boundary_correction_enabled and _corr_lr_raw is not None:
+                _corr_lr = float(_corr_lr_raw)
+                _corr_ids = {id(p) for p in model.correction_heads.parameters()}
+                _loop_optimizer = torch.optim.Adam(
+                    [
+                        {"params": [p for p in model.parameters() if id(p) not in _corr_ids],
+                         "lr": _lr, "weight_decay": _wd},
+                        {"params": [p for p in model.parameters() if id(p) in _corr_ids],
+                         "lr": _corr_lr, "weight_decay": _wd},
+                    ]
+                )
+                print(f"[train] Per-group optimizer: main lr={_lr}, correction_heads lr={_corr_lr}")
             result = train_in_loop_physical_model(
                 model,
-                TorchPCADecoder(encoder),
+                field_decoder,
                 x_train_latent,
                 y_train,
                 x_val_latent,
@@ -182,10 +204,16 @@ def train_from_config(
                 device=device_name,
                 batch_size=int(training_cfg.get("batch_size", 32)),
                 epochs=int(training_cfg.get("epochs", 100)),
-                lr=float(training_cfg.get("lr", 1e-3)),
-                weight_decay=float(training_cfg.get("weight_decay", 1e-4)),
+                lr=_lr,
+                weight_decay=_wd,
                 scheduler=training_cfg.get("scheduler"),
                 patience=int(training_cfg.get("patience", 30)),
+                grad_clip_norm=(
+                    float(training_cfg["grad_clip_norm"])
+                    if training_cfg.get("grad_clip_norm") is not None
+                    else None
+                ),
+                optimizer=_loop_optimizer,
             )
         else:
             result = train_latent_model(
@@ -204,13 +232,22 @@ def train_from_config(
             )
 
     with timer.time(INFERENCE):
-        y_pred_latent = predict_latent(
-            model,
-            x_test_latent,
-            device=device_name,
-            batch_size=int(training_cfg.get("eval_batch_size", 256)),
-        )
-        y_pred = encoder.inverse_transform_outputs(y_pred_latent)
+        if boundary_correction_enabled:
+            # model(x) -> (B, H, W) field directly; no PCA inverse transform needed
+            y_pred = predict_latent(
+                model,
+                x_test_latent,
+                device=device_name,
+                batch_size=int(training_cfg.get("eval_batch_size", 256)),
+            )
+        else:
+            y_pred_latent = predict_latent(
+                model,
+                x_test_latent,
+                device=device_name,
+                batch_size=int(training_cfg.get("eval_batch_size", 256)),
+            )
+            y_pred = encoder.inverse_transform_outputs(y_pred_latent)
 
     metrics = _compute_metrics(y_pred, y_test)
     metrics.update(
@@ -238,6 +275,7 @@ def train_from_config(
             "output_latent_dim": int(y_train_latent.shape[1]),
             "pca_component_counts": encoder.component_counts,
             "in_loop_loss": bool(config.get("mechanisms", {}).get("in_loop_loss", False)),
+            "boundary_correction": boundary_correction_enabled,
             "postprocessing_stage": "none",
             "refinementnet_used": False,
             "warm_start_run_dir": None if warm_start_dir is None else str(warm_start_dir),
@@ -258,6 +296,8 @@ def train_from_config(
             prediction_arrays[optional_key] = np.asarray(data[optional_key][splits["test_idx"]], dtype=np.float32)
     save_npz(run_dir / "predictions_test.npz", **prediction_arrays)
     save_npz(run_dir / "loss_curves.npz", train_loss=result.train_loss, val_loss=result.val_loss)
+    if result.term_losses:
+        save_npz(run_dir / "term_losses.npz", **result.term_losses)
     save_config(config, run_dir)
     save_environment(run_dir / "environment.txt")
     timer.times.update({f"pca_{key}": value for key, value in encoder.timings.items()})
@@ -499,6 +539,7 @@ def _make_model(
     input_dim: int,
     output_dim: int,
     coupling_enabled: bool = False,
+    boundary_correction_enabled: bool = False,
 ):
     model_type = str(model_cfg.get("type", "mlp"))
     hidden_size = int(model_cfg.get("hidden_size", 128))
@@ -508,6 +549,33 @@ def _make_model(
     counts = getattr(encoder, "component_counts", {})
     input_counts = [int(value) for value in counts.get("input_patches", [])]
     output_counts = [int(value) for value in counts.get("output_patches", [])]
+    if boundary_correction_enabled:
+        if not input_counts or not output_counts:
+            raise ValueError("BoundaryCorrectionGNN requires a fitted local-to-local PCA encoder.")
+        patch_slices = getattr(encoder, "patch_slices", [])
+        coupling_cfg = model_cfg.get("coupling", {})
+        bc_cfg = model_cfg.get("boundary_correction", {})
+        patch_size = int(getattr(encoder, "patch_size", 32))
+        pca_decoder = TorchPCADecoder(encoder)
+        model = BoundaryCorrectionGNN(
+            input_component_counts=input_counts,
+            output_component_counts=output_counts,
+            grid_shape=_patch_grid_shape(patch_slices),
+            embed_dim=int(coupling_cfg.get("embed_dim", hidden_size)),
+            num_layers=int(coupling_cfg.get("num_layers", 3)),
+            neighborhood=int(coupling_cfg.get("neighborhood", 8)),
+            dropout=dropout,
+            activation=activation,
+            patch_size=patch_size,
+            delta=int(bc_cfg.get("delta", 4)),
+            pca_decoder=pca_decoder,
+        )
+        print(
+            f"[_make_model] BoundaryCorrectionGNN "
+            f"patches={model.num_patches} patch_size={patch_size} "
+            f"delta={model.delta} embed_dim={model.embed_dim}"
+        )
+        return model
     if coupling_enabled:
         if not input_counts or not output_counts:
             raise ValueError("Coupling requires a fitted local-to-local PCA encoder.")
@@ -696,7 +764,11 @@ def _first_existing(data: dict[str, np.ndarray], keys: list[str]) -> np.ndarray 
 
 def _resolve_device(device: str) -> str:
     if device == "auto":
-        return "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
     if device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA device requested but torch.cuda.is_available() is false.")
     return device

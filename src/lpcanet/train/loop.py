@@ -23,6 +23,7 @@ class TrainingResult:
     best_val_loss: float
     epochs_ran: int
     stopped_early: bool
+    term_losses: dict[str, np.ndarray] | None = None
 
 
 def train_latent_model(
@@ -143,6 +144,8 @@ def train_in_loop_physical_model(
     weight_decay: float = 1e-4,
     scheduler: str | None = None,
     patience: int = 30,
+    grad_clip_norm: float | None = None,
+    optimizer: torch.optim.Optimizer | None = None,
 ) -> TrainingResult:
     """Train with differentiable PCA decode, assembly, and physical-field loss."""
     if epochs <= 0:
@@ -154,7 +157,8 @@ def train_in_loop_physical_model(
     model.to(device)
     decoder.to(device)
     decoder.eval()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    if optimizer is None:
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     lr_scheduler = _make_scheduler(optimizer, scheduler, patience)
 
     train_loader = _make_physical_loader(
@@ -176,6 +180,7 @@ def train_in_loop_physical_model(
 
     train_losses: list[float] = []
     val_losses: list[float] = []
+    term_losses_accum: dict[str, list[float]] = {}
     best_val_loss = float("inf")
     best_state: dict[str, torch.Tensor] | None = None
     schedule = LossWarmupSchedule(loss_config)
@@ -190,14 +195,19 @@ def train_in_loop_physical_model(
         weights = schedule.weights_for_epoch(epoch_index)
         criterion = _make_composite_loss(loss_config, weights)
         model.train()
-        train_loss = _run_physical_epoch(
+        epoch_result = _run_physical_epoch(
             model,
             decoder,
             train_loader,
             criterion,
             device,
             optimizer=optimizer,
+            grad_clip_norm=grad_clip_norm,
+            collect_components=True,
         )
+        train_loss, epoch_components = epoch_result  # type: ignore[misc]
+        for name, value in epoch_components.items():
+            term_losses_accum.setdefault(name, []).append(value)
         model.eval()
         with torch.no_grad():
             val_loss = _run_physical_epoch(
@@ -227,6 +237,7 @@ def train_in_loop_physical_model(
             for name, value in model.state_dict().items()
         }
     model.load_state_dict(best_state)
+    term_losses = {name: np.asarray(values, dtype=np.float32) for name, values in term_losses_accum.items()}
     return TrainingResult(
         best_state_dict=best_state,
         train_loss=np.asarray(train_losses, dtype=np.float32),
@@ -234,6 +245,7 @@ def train_in_loop_physical_model(
         best_val_loss=float(best_val_loss),
         epochs_ran=len(train_losses),
         stopped_early=False,
+        term_losses=term_losses if term_losses else None,
     )
 
 
@@ -445,9 +457,12 @@ def _run_physical_epoch(
     device: torch.device,
     *,
     optimizer: torch.optim.Optimizer | None,
-) -> float:
+    grad_clip_norm: float | None = None,
+    collect_components: bool = False,
+) -> float | tuple[float, dict[str, float]]:
     total_loss = 0.0
     total_count = 0
+    component_totals: dict[str, float] = {}
     for x_batch, y_batch, forcing_batch, coefficient_batch in loader:
         x_batch = x_batch.to(device)
         y_batch = y_batch.to(device)
@@ -457,19 +472,35 @@ def _run_physical_epoch(
             optimizer.zero_grad()
         pred_latent = model(x_batch)
         pred_field = decoder(pred_latent)
-        loss = criterion(
-            pred_field,
-            y_batch,
-            forcing=forcing_arg,
-            coefficient=coefficient_arg,
-        )
+        if collect_components:
+            loss, components = criterion(
+                pred_field,
+                y_batch,
+                forcing=forcing_arg,
+                coefficient=coefficient_arg,
+                return_components=True,
+            )
+            n = int(x_batch.shape[0])
+            for name, value in components.items():
+                component_totals[name] = component_totals.get(name, 0.0) + float(value.item()) * n
+        else:
+            loss = criterion(
+                pred_field,
+                y_batch,
+                forcing=forcing_arg,
+                coefficient=coefficient_arg,
+            )
         if optimizer is not None:
             loss.backward()
+            if grad_clip_norm is not None:
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
             optimizer.step()
         total_loss += float(loss.item()) * x_batch.shape[0]
         total_count += int(x_batch.shape[0])
     if total_count == 0:
         raise ValueError("Cannot train/evaluate on an empty dataset.")
+    if collect_components:
+        return total_loss / total_count, {name: v / total_count for name, v in component_totals.items()}
     return total_loss / total_count
 
 

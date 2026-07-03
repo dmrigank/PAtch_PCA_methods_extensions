@@ -1,0 +1,19 @@
+pca:
+  type: local_to_local
+  solver: randomized
+
+mechanisms:
+  two_scale: false
+  coupling: false
+  in_loop_loss: true
+  boundary_correction: true
+
+model:
+  type: mlp  # ignored when boundary_correction=true; BoundaryCorrectionGNN is constructed instead
+  coupling:
+    backend: gnn
+    embed_dim: 128
+    num_layers: 3
+    neighborhood: 8
+  boundary_correction:
+    delta: 4
