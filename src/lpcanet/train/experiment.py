@@ -527,6 +527,7 @@ def _make_encoder(
             stride=int(patches_cfg["stride"]),
             assembly_weights=weights,
             include_edges=bool(patches_cfg.get("include_edges", False)),
+            guard_band=int(pca_cfg.get("guard_band", 0)),
             **common,
         )
     raise ValueError(f"Unsupported pca.type {pca_type!r}.")

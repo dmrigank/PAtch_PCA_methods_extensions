@@ -1,0 +1,15 @@
+experiment:
+  name: guard_band_g2
+  seed: 0
+  output_dir: results/guard_band_sweep/g2
+
+pca:
+  guard_band: 2
+
+patches:
+  patch_size: 32
+  stride: 32
+  assembly: average
+
+training:
+  device: cuda

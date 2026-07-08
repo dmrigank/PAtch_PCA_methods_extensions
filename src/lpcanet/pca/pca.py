@@ -39,6 +39,48 @@ class IdentityScaler:
         return np.asarray(data)
 
 
+class _CroppedPCA:
+    """PCA wrapper holding guard-band-cropped basis vectors for a single patch.
+
+    After fitting PCA on an enlarged (P+2g)×(P+2g) patch, we discard the guard
+    rows/columns from each component vector and retain only the inner P×P core.
+    The resulting object is a drop-in replacement for the sklearn PCA used by
+    _transform_patch_models and _inverse_patch_models.
+    """
+
+    def __init__(self, components: np.ndarray, mean: np.ndarray) -> None:
+        self.components_ = components   # (k, P²)
+        self.mean_ = mean               # (P²,)
+        self.n_components_ = int(components.shape[0])
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        return (np.asarray(X) - self.mean_) @ self.components_.T
+
+    def inverse_transform(self, Z: np.ndarray) -> np.ndarray:
+        return np.asarray(Z) @ self.components_ + self.mean_
+
+
+class _CroppedScaler:
+    """Scaler wrapper holding guard-band-cropped mean/scale statistics.
+
+    When standardize=True the per-feature mean and scale are cropped to the
+    inner P×P core.  When standardize=False (IdentityScaler), mean=scale=None
+    and this wrapper is a transparent no-op.
+    """
+
+    def __init__(self, mean: np.ndarray | None, scale: np.ndarray | None) -> None:
+        self._mean = mean
+        self._scale = scale
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        X = np.asarray(X)
+        return X if self._mean is None else (X - self._mean) / self._scale
+
+    def inverse_transform(self, X: np.ndarray) -> np.ndarray:
+        X = np.asarray(X)
+        return X if self._mean is None else X * self._scale + self._mean
+
+
 class BasePCAEncoder:
     """Common configuration and serialization behavior for PCA encoders."""
 
@@ -289,6 +331,7 @@ class LocalToLocalPCAEncoder(BasePCAEncoder):
         random_state: int | None = None,
         assembly_weights: np.ndarray | None = None,
         include_edges: bool = False,
+        guard_band: int = 0,
     ) -> None:
         super().__init__(
             input_variance=input_variance,
@@ -303,6 +346,7 @@ class LocalToLocalPCAEncoder(BasePCAEncoder):
         self.stride = stride
         self.assembly_weights = assembly_weights
         self.include_edges = include_edges
+        self.guard_band = int(guard_band)
 
     def fit(self, x_train: np.ndarray, y_train: np.ndarray) -> LocalToLocalPCAEncoder:
         """Fit patchwise input and output PCA models."""
@@ -326,20 +370,30 @@ class LocalToLocalPCAEncoder(BasePCAEncoder):
             flatten=True,
             include_edges=self.include_edges,
         )
-        y_patches = extract_patches_2d(
-            y_train,
-            self.patch_size,
-            self.stride,
-            flatten=True,
-            include_edges=self.include_edges,
-        )
 
         start = perf_counter()
         self.input_models = _fit_patch_models(self, x_patches, self.input_variance)
         self.timings["fit_input_pca"] = perf_counter() - start
 
         start = perf_counter()
-        self.output_models = _fit_patch_models(self, y_patches, self.output_variance)
+        if self.guard_band > 0:
+            y_patches_ext = _extract_guarded_patches(
+                y_train, self.patch_slices, self.patch_size, self.guard_band
+            )
+            output_models_ext = _fit_patch_models(self, y_patches_ext, self.output_variance)
+            self.output_models = [
+                _crop_patch_model(m, self.patch_size, self.guard_band)
+                for m in output_models_ext
+            ]
+        else:
+            y_patches = extract_patches_2d(
+                y_train,
+                self.patch_size,
+                self.stride,
+                flatten=True,
+                include_edges=self.include_edges,
+            )
+            self.output_models = _fit_patch_models(self, y_patches, self.output_variance)
         self.timings["fit_output_pca"] = perf_counter() - start
 
         input_counts = [int(model["pca"].n_components_) for model in self.input_models]
@@ -742,3 +796,60 @@ def _flatten_coarse_fields(fields: np.ndarray) -> np.ndarray:
     if fields.ndim != 3:
         raise ValueError(f"Expected coarse fields with shape (N, H, W), got {fields.shape}.")
     return fields.reshape(fields.shape[0], -1)
+
+
+def _extract_guarded_patches(
+    fields: np.ndarray,
+    patch_slices: list[tuple[slice, slice]],
+    patch_size: int,
+    guard_band: int,
+) -> np.ndarray:
+    """Extract (patch_size+2g)×(patch_size+2g) patches using reflect padding at boundaries.
+
+    For boundary patches, the guard band pixels that would fall outside the field are
+    filled using reflect (not zero) padding so no artificial sharp edges are introduced.
+    For interior patches all guard band pixels come from actual neighboring field data.
+    Returns shape (N, num_patches, (patch_size+2g)²).
+    """
+    g = guard_band
+    ext = patch_size + 2 * g
+    N = fields.shape[0]
+    padded = np.pad(fields, ((0, 0), (g, g), (g, g)), mode="reflect")
+    result = np.empty((N, len(patch_slices), ext * ext), dtype=fields.dtype)
+    for pidx, (rsl, csl) in enumerate(patch_slices):
+        r0, c0 = rsl.start, csl.start
+        result[:, pidx] = padded[:, r0 : r0 + ext, c0 : c0 + ext].reshape(N, -1)
+    return result
+
+
+def _crop_patch_model(
+    model: dict[str, Any],
+    patch_size: int,
+    guard_band: int,
+) -> dict[str, Any]:
+    """Crop a guard-band-fitted patch model to the inner patch_size×patch_size core.
+
+    Slices the PCA component vectors and scaler statistics to the P² pixels
+    corresponding to the core patch, discarding the surrounding guard band rows/cols.
+    The returned model is a drop-in replacement with the same interface.
+    """
+    g = guard_band
+    ext = patch_size + 2 * g
+    idx = np.arange(ext * ext).reshape(ext, ext)[g : g + patch_size, g : g + patch_size].ravel()
+
+    old_pca = model["pca"]
+    new_pca = _CroppedPCA(
+        components=np.asarray(old_pca.components_[:, idx], dtype=np.float64),
+        mean=np.asarray(old_pca.mean_[idx], dtype=np.float64),
+    )
+
+    old_scaler = model["scaler"]
+    if isinstance(old_scaler, StandardScaler):
+        new_scaler = _CroppedScaler(
+            mean=np.asarray(old_scaler.mean_[idx], dtype=np.float64),
+            scale=np.asarray(old_scaler.scale_[idx], dtype=np.float64),
+        )
+    else:
+        new_scaler = _CroppedScaler(mean=None, scale=None)
+
+    return {"scaler": new_scaler, "pca": new_pca}
