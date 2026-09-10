@@ -12,6 +12,7 @@ from collections.abc import Mapping
 import torch
 from torch import nn
 
+from lpcanet.metrics.residuals import POISSON_RESIDUAL_CONVENTION
 from lpcanet.metrics.torch_ops import (
     darcy_residual_torch,
     interface_flux_jump_torch,
@@ -137,10 +138,16 @@ def pde_residual_loss(
     equation: str = "poisson",
     coefficient: torch.Tensor | float | None = None,
     reduction: str = "rms",
+    poisson_convention: str = POISSON_RESIDUAL_CONVENTION,
 ) -> torch.Tensor:
     """Finite-difference PDE residual loss for Poisson or Darcy equations."""
     if equation == "poisson":
-        residual = poisson_residual_torch(pred, forcing, dx)
+        residual = poisson_residual_torch(
+            pred,
+            forcing,
+            dx,
+            convention=poisson_convention,
+        )
     elif equation == "darcy":
         if coefficient is None:
             raise ValueError("Darcy residual loss requires coefficient.")
@@ -180,6 +187,7 @@ class CompositeLoss(nn.Module):
         include_edges: bool = False,
         pde: str = "poisson",
         pde_reduction: str = "rms",
+        poisson_convention: str = POISSON_RESIDUAL_CONVENTION,
         spectral_high_k_weight_power: float = 1.0,
         interface_target: str = "zero",
         eps: float = 1e-12,
@@ -199,6 +207,7 @@ class CompositeLoss(nn.Module):
         self.include_edges = include_edges
         self.pde = pde
         self.pde_reduction = pde_reduction
+        self.poisson_convention = poisson_convention
         self.spectral_high_k_weight_power = spectral_high_k_weight_power
         if interface_target not in {"zero", "truth"}:
             raise ValueError("interface_target must be 'zero' or 'truth'.")
@@ -264,6 +273,7 @@ class CompositeLoss(nn.Module):
                 equation=self.pde,
                 coefficient=coefficient,
                 reduction=self.pde_reduction,
+                poisson_convention=self.poisson_convention,
             )
             total = total + self.weights["pde_residual"] * components["pde_residual"]
 

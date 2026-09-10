@@ -4,12 +4,22 @@ from __future__ import annotations
 
 import numpy as np
 
+POISSON_RESIDUAL_CONVENTION = "delta_u_equals_f"
+PDE_METRICS_VERSION = 2
 
-def poisson_residual(u_pred: np.ndarray, f: np.ndarray, dx: float) -> np.ndarray:
-    """Return interior residual for ``-Delta u = f``.
+
+def poisson_residual(
+    u_pred: np.ndarray,
+    f: np.ndarray,
+    dx: float,
+    *,
+    convention: str = POISSON_RESIDUAL_CONVENTION,
+) -> np.ndarray:
+    """Return the interior residual for the legacy equation ``Delta u = f``.
 
     Boundary values are not evaluated; the returned shape is ``(N, H-2, W-2)``.
     """
+    _validate_poisson_convention(convention)
     u_pred = _as_batch_field(u_pred, "u_pred")
     field_shape = (int(u_pred.shape[0]), int(u_pred.shape[1]), int(u_pred.shape[2]))
     f = _broadcast_field(f, field_shape, "f")
@@ -21,7 +31,7 @@ def poisson_residual(u_pred: np.ndarray, f: np.ndarray, dx: float) -> np.ndarray
         + u_pred[:, 1:-1, :-2]
         - 4.0 * u_pred[:, 1:-1, 1:-1]
     ) / (dx**2)
-    return -laplacian - f[:, 1:-1, 1:-1]
+    return laplacian - f[:, 1:-1, 1:-1]
 
 
 def darcy_residual(u_pred: np.ndarray, a: np.ndarray, f: np.ndarray, dx: float) -> np.ndarray:
@@ -80,3 +90,11 @@ def _broadcast_field(array: np.ndarray, shape: tuple[int, int, int], name: str) 
 def _validate_dx(dx: float) -> None:
     if dx <= 0:
         raise ValueError("dx must be positive.")
+
+
+def _validate_poisson_convention(convention: str) -> None:
+    if convention != POISSON_RESIDUAL_CONVENTION:
+        raise ValueError(
+            "Unsupported Poisson convention "
+            f"{convention!r}; expected {POISSON_RESIDUAL_CONVENTION!r}."
+        )

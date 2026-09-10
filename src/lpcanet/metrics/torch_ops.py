@@ -10,6 +10,7 @@ from __future__ import annotations
 import torch
 
 from lpcanet.assembly.patching import get_patch_slices
+from lpcanet.metrics.residuals import POISSON_RESIDUAL_CONVENTION
 
 
 def as_batch_field(field: torch.Tensor, name: str) -> torch.Tensor:
@@ -193,10 +194,17 @@ def poisson_residual_torch(
     u_pred: torch.Tensor,
     f: torch.Tensor | float,
     dx: float,
+    *,
+    convention: str = POISSON_RESIDUAL_CONVENTION,
 ) -> torch.Tensor:
-    """Interior residual for ``-Delta u = f``."""
+    """Interior residual for the legacy equation ``Delta u = f``."""
     if dx <= 0.0:
         raise ValueError("dx must be positive.")
+    if convention != POISSON_RESIDUAL_CONVENTION:
+        raise ValueError(
+            "Unsupported Poisson convention "
+            f"{convention!r}; expected {POISSON_RESIDUAL_CONVENTION!r}."
+        )
     u_pred = as_batch_field(u_pred, "u_pred")
     if u_pred.shape[1] < 3 or u_pred.shape[2] < 3:
         raise ValueError(f"u_pred grid must be at least 3x3, got {tuple(u_pred.shape)}.")
@@ -209,7 +217,7 @@ def poisson_residual_torch(
         + u_pred[:, 1:-1, :-2]
         - 4.0 * u_pred[:, 1:-1, 1:-1]
     ) / (dx**2)
-    return -laplacian - forcing[:, 1:-1, 1:-1]
+    return laplacian - forcing[:, 1:-1, 1:-1]
 
 
 def darcy_residual_torch(

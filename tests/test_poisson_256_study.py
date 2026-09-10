@@ -6,6 +6,7 @@ import numpy as np
 
 from lpcanet.pca.randomized_svd import fit_pca
 from lpcanet.train.factorial import expand_method_study_runs
+from lpcanet.utils.config import compose_config
 
 
 def test_poisson_256_seed0_study_expands_requested_methods() -> None:
@@ -72,3 +73,35 @@ def test_randomized_pca_preserves_float32_storage() -> None:
 
     assert pca.components_.dtype == np.float32
     assert pca.mean_.dtype == np.float32
+
+
+def test_poisson_256_gnn_interface_correction_config() -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = compose_config(
+        root=root,
+        dataset="poisson",
+        model="l2l",
+        experiment="poisson_256_gnn_interface_seed0",
+    )
+
+    assert config["mechanisms"] == {
+        "two_scale": False,
+        "coupling": True,
+        "in_loop_loss": True,
+    }
+    assert config["warm_start"] == {
+        "enabled": True,
+        "run_dir": "results/poisson_256_seed0/resolution_256/plain_l2l/seed_0",
+    }
+    coupling = config["model"]["coupling"]
+    assert coupling["mode"] == "boundary_correction"
+    assert coupling["backend"] == "gnn"
+    assert coupling["freeze_base"] is True
+    assert int(coupling["boundary_width"]) == 8
+    assert coupling["smooth_taper"] is True
+    assert float(coupling["correction_regularization"]) == 1.0e-4
+    assert config["loss"]["interface_target"] == "truth"
+    assert "interface_value" in config["loss"]["active_terms"]
+    assert "interface_flux" in config["loss"]["active_terms"]
+    assert int(config["dataset"]["grid_size"]) == 256
+    assert config["dataset"]["processed_path"] == "data/processed/poisson_256.npz"

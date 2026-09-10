@@ -2,6 +2,7 @@
 /outputs/
 /paper_assets/
 /results/
+/paper_results/
 /legacy/
 *.mat
 *.npz

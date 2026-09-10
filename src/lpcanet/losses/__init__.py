@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from lpcanet.losses.latent import TwoScaleLatentLoss
 from lpcanet.losses.terms import (
     DEFAULT_LOSS_WEIGHTS,
     CompositeLoss,
@@ -31,6 +32,7 @@ def relative_l2_error(pred: torch.Tensor, true: torch.Tensor, eps: float = 1e-12
 __all__ = [
     "CompositeLoss",
     "DEFAULT_LOSS_WEIGHTS",
+    "TwoScaleLatentLoss",
     "interface_flux_loss",
     "interface_value_loss",
     "mse_loss",

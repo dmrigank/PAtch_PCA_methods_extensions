@@ -35,6 +35,20 @@ def test_256_study_plot_script_writes_all_comparisons(tmp_path: Path) -> None:
             y_pred=truth + np.float32(0.001 * (index + 1)),
             sample_indices=np.asarray([10, 11], dtype=np.int64),
         )
+    gnn_dir = tmp_path / "gnn_interface"
+    gnn_dir.mkdir()
+    np.savez_compressed(
+        gnn_dir / "predictions_test.npz",
+        x_input=inputs,
+        y_true=truth,
+        y_pred=truth + np.float32(0.0005),
+        sample_indices=np.asarray([10, 11], dtype=np.int64),
+    )
+    (gnn_dir / "runtime.json").write_text(
+        '{"stages": {"pca_fit": 0.0, "latent_transform": 0.1, '
+        '"nn_train": 0.2, "inference": 0.01, "end_to_end": 0.4}}',
+        encoding="utf-8",
+    )
 
     pd.DataFrame(
         [
@@ -65,6 +79,8 @@ def test_256_study_plot_script_writes_all_comparisons(tmp_path: Path) -> None:
             str(results_dir),
             "--output",
             str(output),
+            "--gnn-interface-dir",
+            str(gnn_dir),
         ],
         cwd=root,
         capture_output=True,

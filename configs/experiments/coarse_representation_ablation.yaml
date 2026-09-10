@@ -1,0 +1,49 @@
+experiment:
+  name: coarse_representation_ablation
+  seed: 0
+  output_dir: paper_results/coarse_representation_ablation
+
+matrix:
+  study_type: coarse_representation_ablation
+  output_root: paper_results/coarse_representation_ablation
+  n_train: 8000
+  pca_solver: randomized
+  seeds: [0, 1, 2]
+  processed_paths:
+    128: data/processed/poisson_128.npz
+    256: data/processed/poisson_256.npz
+  resolutions:
+    128:
+      patch_size: 32
+      stride: 32
+    256:
+      patch_size: 64
+      stride: 64
+  exact_coarse_ranks: [5, 10, 20, 40]
+  coarse_factors:
+    128: [2, 4, 8]
+    256: [4, 8]
+  residual_variances: [0.95, 0.99, 0.995]
+  default_exact_rank: 10
+  default_coarse_factor: 4
+  default_residual_variance: 0.99
+  adaptive_reference:
+    coarse_components: 20
+    coarse_variance: 0.99
+
+mechanisms:
+  two_scale: true
+  coupling: false
+  in_loop_loss: false
+
+pca:
+  solver: randomized
+
+training:
+  latent_loss:
+    mode: block_balanced
+    coarse_weight: 0.5
+    residual_weight: 0.5
+
+evaluation:
+  pca_oracle: true

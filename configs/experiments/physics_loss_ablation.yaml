@@ -1,0 +1,86 @@
+experiment:
+  name: physics_loss_ablation
+  seed: 0
+  output_dir: paper_results/physics_loss_ablation
+
+matrix:
+  study_type: physics_loss_ablation
+  output_root: paper_results/physics_loss_ablation
+  baseline_root: paper_results/coarse_representation_ablation/poisson
+  baseline_cell: residual_variance_0p995
+  resolutions: [128, 256]
+  seeds: [0, 1, 2]
+  screen_resolution: 128
+  screen_seed: 0
+  mre_guardrail_fraction: 0.05
+  processed_paths:
+    128: data/processed/poisson_128.npz
+    256: data/processed/poisson_256.npz
+  resolution_settings:
+    128:
+      patch_size: 32
+      stride: 32
+    256:
+      patch_size: 64
+      stride: 64
+  representation:
+    solver: randomized
+    coarse_factor: 4
+    coarse_components: 10
+    coarse_variance: 1.0
+    residual_variance: 0.995
+  fine_tune:
+    epochs: 50
+    lr: 1.0e-4
+    weight_decay: 0.0
+    scheduler: none
+    reconstruction_epochs: 5
+    ramp_epochs: 10
+  calibration:
+    max_samples: 128
+    batch_size: 16
+    minimum_weight: 1.0e-12
+    maximum_weight: 1.0e6
+  default_target_ratios:
+    interface_value: 0.05
+    interface_flux: 0.05
+    spectral: 0.05
+    pde_residual: 0.01
+  weight_levels:
+    interface_value:
+      low: 0.25
+      default: 1.0
+      high: 4.0
+    interface_flux:
+      low: 0.25
+      default: 1.0
+      high: 4.0
+    spectral:
+      "off": 0.0
+      default: 1.0
+      high: 4.0
+    pde_residual:
+      "off": 0.0
+      low: 1.0
+
+mechanisms:
+  two_scale: true
+  coupling: false
+  in_loop_loss: true
+
+pca:
+  solver: randomized
+  output_variance: 0.995
+  two_scale:
+    coarse_factor: 4
+    coarse_components: 10
+    coarse_variance: 1.0
+
+training:
+  latent_loss:
+    mode: block_balanced
+    coarse_weight: 0.5
+    residual_weight: 0.5
+
+evaluation:
+  validation_metrics: true

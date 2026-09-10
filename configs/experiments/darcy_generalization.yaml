@@ -1,0 +1,76 @@
+experiment:
+  name: darcy_generalization
+  seed: 0
+  output_dir: paper_results/darcy_generalization
+
+matrix:
+  study_type: darcy_generalization
+  output_root: paper_results/darcy_generalization
+  n_train: 8000
+  seeds: [0, 1, 2, 3, 4]
+  # Preserve dependency order: two_scale_interface warm-starts from two_scale.
+  methods:
+    - global_pca
+    - plain_l2l
+    - overlap_l2l
+    - two_scale
+    - two_scale_interface
+    - fno
+  darcy_methods:
+    - global_pca
+    - plain_l2l
+    - overlap_l2l
+    - fno
+    - two_scale
+    - two_scale_interface
+  processed_paths:
+    256: data/processed/darcy_256.npz
+  resolutions:
+    256:
+      patch_size: 64
+      plain_stride: 64
+      overlap_stride: 32
+      coarse_factor: 4
+  representation:
+    solver: randomized
+    input_variance: 0.99
+    local_output_variance: 0.99
+    residual_variance: 0.995
+    coarse_components: 10
+    coarse_variance: 1.0
+    randomized_oversampling: 20
+    randomized_n_iter: 4
+  latent_training:
+    batch_size: 32
+    eval_batch_size: 256
+    epochs: 500
+    lr: 1.0e-3
+    weight_decay: 1.0e-4
+    scheduler: reduce_on_plateau
+    patience: 30
+  interface_fine_tune:
+    epochs: 50
+    lr: 1.0e-4
+    weight_decay: 0.0
+    scheduler: none
+    reconstruction_epochs: 5
+    ramp_epochs: 10
+    value_target_ratio: 0.2
+    flux_target_ratio: 0.2
+    calibration_batch_size: 16
+    calibration_samples: 128
+  fno_training:
+    batch_size: 4
+    eval_batch_size: 8
+    epochs: 100
+    lr: 1.0e-3
+    weight_decay: 0.0
+    scheduler: reduce_on_plateau
+    patience: 5
+    early_stopping:
+      enabled: true
+      patience: 15
+      min_delta: 0.0
+  prediction_retention:
+    seeds: [0]
+    resolutions: [256]

@@ -1,27 +1,89 @@
 experiment:
   name: resolution_sweep
   seed: 0
-  output_dir: results/resolution_sweep
+  output_dir: paper_results/resolution_sweep
 
 matrix:
-  output_root: results/resolution_sweep
-  n_samples: 8000
-  main:
+  study_type: resolution_sweep
+  output_root: paper_results/resolution_sweep
+  n_train: 8000
+  seeds: [0, 1, 2]
+  methods:
+    - global_pca
+    - plain_l2l
+    - overlap_l2l
+    - two_scale
+    - two_scale_interface
+    - fno
+  processed_paths:
+    64: data/processed/poisson_64.npz
+    128: data/processed/poisson_128.npz
+    256: data/processed/poisson_256.npz
+  resolutions:
+    64:
+      patch_size: 16
+      plain_stride: 16
+      overlap_stride: 8
+      coarse_factor: 4
+    128:
+      patch_size: 32
+      plain_stride: 32
+      overlap_stride: 16
+      coarse_factor: 4
+    256:
+      patch_size: 64
+      plain_stride: 64
+      overlap_stride: 32
+      coarse_factor: 4
+  representation:
+    solver: randomized
+    input_variance: 0.99
+    local_output_variance: 0.99
+    residual_variance: 0.995
+    coarse_components: 10
+    coarse_variance: 1.0
+    randomized_oversampling: 20
+    randomized_n_iter: 4
+  latent_training:
+    batch_size: 32
+    eval_batch_size: 256
+    epochs: 500
+    lr: 1.0e-3
+    weight_decay: 1.0e-4
+    scheduler: reduce_on_plateau
+    patience: 30
+  interface_fine_tune:
+    epochs: 50
+    lr: 1.0e-4
+    weight_decay: 0.0
+    scheduler: none
+    reconstruction_epochs: 5
+    ramp_epochs: 10
+    value_target_ratio: 0.2
+    flux_target_ratio: 0.2
+    calibration_batch_size: 16
+    calibration_samples: 128
+  fno_training:
+    batch_size: 16
+    eval_batch_size: 64
+    epochs: 100
+    lr: 1.0e-3
+    weight_decay: 0.0
+    scheduler: reduce_on_plateau
+    patience: 5
+    early_stopping:
+      enabled: true
+      patience: 15
+      min_delta: 0.0
+  prediction_retention:
+    seeds: [0]
     resolutions: [64, 128, 256]
-    models: [l2l, l2l_overlap, full]
-    coarse_factor: 4
   optional:
     enabled: false
-    resolutions: [512]
-    models: [l2l, full]
+    processed_path: data/processed/poisson_512.npz
+    resolution: 512
+    patch_size: 128
+    plain_stride: 128
+    overlap_stride: 64
     coarse_factor: 8
-  seeds: [0, 1, 2, 3, 4]
-
-data_cache:
-  root: data/processed
-  deterministic: true
-  key_fields:
-    - dataset.name
-    - dataset.grid_size
-    - matrix.n_samples
-    - experiment.seed
+    methods: [plain_l2l, two_scale]

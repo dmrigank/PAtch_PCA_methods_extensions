@@ -5,9 +5,10 @@ import pytest
 import torch
 
 from lpcanet.metrics import mre
-from lpcanet.models.coupling import CouplingOperator
+from lpcanet.models.coupling import CouplingOperator, GNNBoundaryCorrection, GNNInterfaceCorrection
 from lpcanet.models.mlp import MLP
 from lpcanet.pca.pca import LocalToLocalPCAEncoder
+from lpcanet.pca.torch_decoder import TorchPCADecoder
 from lpcanet.train.loop import predict_latent, train_latent_model
 from lpcanet.train.seeding import set_seed
 
@@ -64,6 +65,95 @@ def test_attention_guardrail_asserts_above_n_max() -> None:
             attention_heads=2,
             attention_n_max=256,
         )
+
+
+def test_gnn_interface_correction_starts_as_zero_delta() -> None:
+    torch.manual_seed(0)
+    input_counts = [2, 3, 1, 4]
+    output_counts = [1, 2, 3, 1]
+    base = MLP(
+        input_dim=sum(input_counts),
+        output_dim=sum(output_counts),
+        hidden_size=8,
+        num_layers=2,
+    )
+    model = GNNInterfaceCorrection(
+        base_model=base,
+        input_component_counts=input_counts,
+        output_component_counts=output_counts,
+        grid_shape=(2, 2),
+        embed_dim=12,
+        num_layers=2,
+        neighborhood=8,
+        freeze_base=True,
+        delta_regularization=1.0e-3,
+    )
+    x = torch.randn(6, sum(input_counts))
+
+    with torch.no_grad():
+        base_output = base(x)
+        corrected = model(x)
+
+    torch.testing.assert_close(corrected, base_output)
+    assert model.regularization_loss().item() == pytest.approx(0.0)
+    assert all(not parameter.requires_grad for parameter in model.base_model.parameters())
+
+
+def test_gnn_boundary_correction_starts_as_core_and_masks_interior() -> None:
+    rng = np.random.default_rng(2)
+    x = rng.normal(size=(24, 16, 16)).astype(np.float32)
+    y = rng.normal(size=(24, 16, 16)).astype(np.float32)
+    encoder = LocalToLocalPCAEncoder(
+        patch_size=8,
+        stride=8,
+        input_variance=1,
+        output_variance=1,
+        solver="full",
+        standardize=True,
+        random_state=0,
+    ).fit(x[:18], y[:18])
+    x_latent = torch.from_numpy(encoder.transform_inputs(x[18:22]))
+    counts = encoder.component_counts
+    base = MLP(
+        input_dim=x_latent.shape[1],
+        output_dim=int(sum(counts["output_patches"])),
+        hidden_size=16,
+        num_layers=2,
+    )
+    decoder = TorchPCADecoder(encoder)
+    model = GNNBoundaryCorrection(
+        base_model=base,
+        physical_decoder=decoder,
+        input_component_counts=[int(value) for value in counts["input_patches"]],
+        output_component_counts=[int(value) for value in counts["output_patches"]],
+        grid_shape=(2, 2),
+        embed_dim=12,
+        num_layers=1,
+        boundary_width=2,
+        smooth_taper=False,
+        freeze_base=True,
+        correction_regularization=1.0e-3,
+    )
+
+    with torch.no_grad():
+        base_latent = base(x_latent)
+        core = decoder(base_latent)
+        corrected = model.predict_physical(x_latent)
+
+    torch.testing.assert_close(corrected, core)
+    assert model.regularization_loss().item() == pytest.approx(0.0)
+
+    for boundary_decoder in model.boundary_decoders:
+        torch.nn.init.zeros_(boundary_decoder.weight)
+        torch.nn.init.ones_(boundary_decoder.bias)
+    with torch.no_grad():
+        shifted = model.predict_physical(x_latent)
+    diff = shifted - core
+    for row_start in (0, 8):
+        for col_start in (0, 8):
+            interior = diff[:, row_start + 2 : row_start + 6, col_start + 2 : col_start + 6]
+            assert torch.count_nonzero(interior) == 0
+    assert torch.count_nonzero(diff) > 0
 
 
 def test_coupling_poisson128_run_improves_mre_over_plain_l2l() -> None:

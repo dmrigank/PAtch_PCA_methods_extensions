@@ -15,7 +15,9 @@ import torch
 from lpcanet.assembly.windows import hann2d, safe_hann2d
 from lpcanet.data.io import load_npz, save_npz
 from lpcanet.data.splits import make_splits
-from lpcanet.models.coupling import CouplingOperator
+from lpcanet.losses import TwoScaleLatentLoss
+from lpcanet.metrics.evaluate import evaluate_prediction_set
+from lpcanet.models.coupling import CouplingOperator, GNNBoundaryCorrection, GNNInterfaceCorrection
 from lpcanet.models.fno import FNO2d
 from lpcanet.models.mlp import MLP, count_parameters
 from lpcanet.models.patchwise_heads import (
@@ -26,6 +28,7 @@ from lpcanet.models.patchwise_heads import (
     SingleConcatMLP,
 )
 from lpcanet.pca.pca import (
+    ContextOutputLocalToLocalPCAEncoder,
     GlobalPCAEncoder,
     LocalToGlobalPCAEncoder,
     LocalToLocalPCAEncoder,
@@ -39,8 +42,10 @@ from lpcanet.train.checkpointing import (
     save_model,
 )
 from lpcanet.train.loop import (
+    calibrate_physical_loss_weights,
     predict_images,
     predict_latent,
+    predict_physical_fields,
     train_image_model,
     train_in_loop_physical_model,
     train_latent_model,
@@ -103,7 +108,18 @@ def train_from_config(
 
     x_all = _select_input_array(data, dataset_cfg.get("input_keys", ["f"]))
     y_all = np.asarray(data[dataset_cfg.get("output_key", "u")], dtype=np.float32)
-    splits = _select_splits(data, len(y_all), seed=seed, force_regenerate=limit_samples is not None)
+    splits = _select_splits(
+        data,
+        len(y_all),
+        seed=seed,
+        force_regenerate=(
+            limit_samples is not None
+            or not bool(dataset_cfg.get("use_embedded_splits", True))
+        ),
+    )
+    splits = _select_training_subset(splits, dataset_cfg)
+    if bool(dataset_cfg.get("save_split_indices", False)):
+        save_npz(run_dir / "split_indices.npz", **splits)
 
     x_train, y_train = x_all[splits["train_idx"]], y_all[splits["train_idx"]]
     x_val, y_val = x_all[splits["val_idx"]], y_all[splits["val_idx"]]
@@ -146,6 +162,12 @@ def train_from_config(
         y_val_latent = encoder.transform_outputs(y_val)
         x_test_latent = encoder.transform_inputs(x_test)
 
+    y_pca_oracle: np.ndarray | None = None
+    if bool(config.get("evaluation", {}).get("pca_oracle", False)):
+        with timer.time("pca_oracle"):
+            y_test_latent = encoder.transform_outputs(y_test)
+            y_pca_oracle = encoder.inverse_transform_outputs(y_test_latent)
+
     model_cfg = config.setdefault("model", {})
     model = _make_model(
         model_cfg,
@@ -160,16 +182,73 @@ def train_from_config(
             map_location="cpu",
             weights_only=True,
         )
-        model.load_state_dict(state_dict)
+        if hasattr(model, "load_warm_start_state"):
+            model.load_warm_start_state(state_dict)
+        else:
+            model.load_state_dict(state_dict)
+
+    in_loop_loss = bool(config.get("mechanisms", {}).get("in_loop_loss", False))
+    loss_config: dict[str, Any] | None = None
+    forcing_all: np.ndarray | None = None
+    coefficient_all: np.ndarray | None = None
+    physical_decoder: TorchPCADecoder | None = None
+    calibration_details: dict[str, Any] = {}
+    if in_loop_loss:
+        loss_config = _make_in_loop_loss_config(config, y_train.shape[-1])
+        forcing_all, coefficient_all = _select_pde_arrays(data, x_all, loss_config["pde"])
+        physical_decoder = TorchPCADecoder(encoder)
+        calibration_cfg = loss_config.get("weight_calibration", {})
+        if isinstance(calibration_cfg, dict) and bool(calibration_cfg.get("enabled", False)):
+            raw_ratios = calibration_cfg.get("target_ratios", {})
+            if not isinstance(raw_ratios, dict):
+                raise TypeError("loss.weight_calibration.target_ratios must be a mapping.")
+            target_ratios = {
+                str(name): float(value) for name, value in raw_ratios.items()
+            }
+            with timer.time("loss_calibration"):
+                calibrated_weights, initial_components = calibrate_physical_loss_weights(
+                    model,
+                    physical_decoder,
+                    x_val_latent,
+                    y_val,
+                    forcing_val=(
+                        None
+                        if forcing_all is None
+                        else forcing_all[splits["val_idx"]]
+                    ),
+                    coefficient_val=(
+                        None
+                        if coefficient_all is None
+                        else coefficient_all[splits["val_idx"]]
+                    ),
+                    loss_config=loss_config,
+                    target_ratios=target_ratios,
+                    device=device_name,
+                    batch_size=int(calibration_cfg.get("batch_size", 16)),
+                    max_samples=int(calibration_cfg.get("max_samples", 128)),
+                    minimum_weight=float(
+                        calibration_cfg.get("minimum_weight", 1.0e-12)
+                    ),
+                    maximum_weight=float(
+                        calibration_cfg.get("maximum_weight", 1.0e6)
+                    ),
+                )
+            loss_config["weights"] = calibrated_weights
+            config.setdefault("loss", {})["weights"] = calibrated_weights
+            calibration_details = {
+                "enabled": True,
+                "target_ratios": target_ratios,
+                "initial_components": initial_components,
+                "calibrated_weights": calibrated_weights,
+            }
 
     with timer.time(NN_TRAIN):
-        in_loop_loss = bool(config.get("mechanisms", {}).get("in_loop_loss", False))
         if in_loop_loss:
-            loss_config = _make_in_loop_loss_config(config, y_train.shape[-1])
-            forcing_all, coefficient_all = _select_pde_arrays(data, x_all, loss_config["pde"])
+            assert loss_config is not None
+            assert physical_decoder is not None
             result = train_in_loop_physical_model(
                 model,
-                TorchPCADecoder(encoder),
+                physical_decoder,
                 x_train_latent,
                 y_train,
                 x_val_latent,
@@ -188,6 +267,7 @@ def train_from_config(
                 patience=int(training_cfg.get("patience", 30)),
             )
         else:
+            latent_criterion = _make_latent_criterion(config, encoder)
             result = train_latent_model(
                 model,
                 x_train_latent,
@@ -201,16 +281,76 @@ def train_from_config(
                 weight_decay=float(training_cfg.get("weight_decay", 1e-4)),
                 scheduler=training_cfg.get("scheduler"),
                 patience=int(training_cfg.get("patience", 30)),
+                criterion=latent_criterion,
             )
 
     with timer.time(INFERENCE):
-        y_pred_latent = predict_latent(
-            model,
-            x_test_latent,
-            device=device_name,
-            batch_size=int(training_cfg.get("eval_batch_size", 256)),
+        if hasattr(model, "predict_physical"):
+            if physical_decoder is None:
+                physical_decoder = TorchPCADecoder(encoder)
+            y_pred = predict_physical_fields(
+                model,
+                physical_decoder,
+                x_test_latent,
+                device=device_name,
+                batch_size=int(training_cfg.get("eval_batch_size", 256)),
+            )
+        else:
+            y_pred_latent = predict_latent(
+                model,
+                x_test_latent,
+                device=device_name,
+                batch_size=int(training_cfg.get("eval_batch_size", 256)),
+            )
+            y_pred = encoder.inverse_transform_outputs(y_pred_latent)
+
+    validation_metrics: dict[str, float] = {}
+    if bool(config.get("evaluation", {}).get("validation_metrics", False)):
+        with timer.time("validation_inference"):
+            if hasattr(model, "predict_physical"):
+                if physical_decoder is None:
+                    physical_decoder = TorchPCADecoder(encoder)
+                y_val_pred = predict_physical_fields(
+                    model,
+                    physical_decoder,
+                    x_val_latent,
+                    device=device_name,
+                    batch_size=int(training_cfg.get("eval_batch_size", 256)),
+                )
+            else:
+                y_val_latent_pred = predict_latent(
+                    model,
+                    x_val_latent,
+                    device=device_name,
+                    batch_size=int(training_cfg.get("eval_batch_size", 256)),
+                )
+                y_val_pred = encoder.inverse_transform_outputs(y_val_latent_pred)
+        validation_arrays: dict[str, np.ndarray] = {
+            "x_input": x_val.astype(np.float32, copy=False),
+            "y_true": y_val.astype(np.float32, copy=False),
+            "y_pred": y_val_pred.astype(np.float32, copy=False),
+        }
+        for optional_key in (
+            "a",
+            "f",
+            "coeff",
+            "coefficient",
+            "permeability",
+            "source",
+            "forcing",
+        ):
+            if optional_key in data:
+                validation_arrays[optional_key] = np.asarray(
+                    data[optional_key][splits["val_idx"]],
+                    dtype=np.float32,
+                )
+        validation_metrics = evaluate_prediction_set(
+            y_val_pred,
+            y_val,
+            predictions=validation_arrays,
+            config=config,
+            requested=list(config.get("evaluation", {}).get("metrics", [])),
         )
-        y_pred = encoder.inverse_transform_outputs(y_pred_latent)
 
     metrics = _compute_metrics(y_pred, y_test)
     metrics.update(
@@ -223,8 +363,17 @@ def train_from_config(
             "n_train": int(len(y_train)),
             "n_val": int(len(y_val)),
             "n_test": int(len(y_test)),
+            "epochs_ran": result.epochs_ran,
+            "stopped_early": float(result.stopped_early),
         }
     )
+    if calibration_details:
+        for name, value in calibration_details["calibrated_weights"].items():
+            metrics[f"calibrated_weight_{name}"] = float(value)
+        for name, value in calibration_details["initial_components"].items():
+            metrics[f"initial_loss_{name}"] = float(value)
+        for name, value in calibration_details["target_ratios"].items():
+            metrics[f"target_ratio_{name}"] = float(value)
     metrics["pca_fit_seconds"] = 0.0 if warm_start_dir is not None else float(
         encoder.timings.get("fit_input_pca", 0.0) + encoder.timings.get("fit_output_pca", 0.0)
     )
@@ -241,23 +390,48 @@ def train_from_config(
             "postprocessing_stage": "none",
             "refinementnet_used": False,
             "warm_start_run_dir": None if warm_start_dir is None else str(warm_start_dir),
+            "latent_loss": _resolved_latent_loss(config, encoder),
+            "loss_calibration": calibration_details,
         }
     )
 
     encoder.save(run_dir / "pca_encoder.joblib")
     save_model(model, run_dir / "model.pt")
     save_metrics(metrics, run_dir)
+    if validation_metrics:
+        save_json(validation_metrics, run_dir / "validation_metrics.json")
     prediction_arrays: dict[str, np.ndarray] = {
         "x_input": x_test.astype(np.float32, copy=False),
         "y_true": y_test.astype(np.float32, copy=False),
         "y_pred": y_pred.astype(np.float32, copy=False),
         "sample_indices": splits["test_idx"].astype(np.int64),
     }
+    if y_pca_oracle is not None:
+        prediction_arrays["y_pca_oracle"] = y_pca_oracle.astype(
+            np.float32,
+            copy=False,
+        )
     for optional_key in ("a", "f", "coeff", "coefficient", "permeability", "source", "forcing"):
         if optional_key in data:
             prediction_arrays[optional_key] = np.asarray(data[optional_key][splits["test_idx"]], dtype=np.float32)
     save_npz(run_dir / "predictions_test.npz", **prediction_arrays)
-    save_npz(run_dir / "loss_curves.npz", train_loss=result.train_loss, val_loss=result.val_loss)
+    loss_curve_arrays: dict[str, np.ndarray] = {
+        "train_loss": result.train_loss,
+        "val_loss": result.val_loss,
+    }
+    loss_curve_arrays.update(
+        {
+            f"train_component_{name}": values
+            for name, values in result.train_components.items()
+        }
+    )
+    loss_curve_arrays.update(
+        {
+            f"val_component_{name}": values
+            for name, values in result.val_components.items()
+        }
+    )
+    save_npz(run_dir / "loss_curves.npz", **loss_curve_arrays)
     save_config(config, run_dir)
     save_environment(run_dir / "environment.txt")
     timer.times.update({f"pca_{key}": value for key, value in encoder.timings.items()})
@@ -265,7 +439,7 @@ def train_from_config(
         timer.add(COARSE_SVD, float(encoder.timings["fit_coarse_svd"]))
     timer.add(END_TO_END, perf_counter() - end_to_end_start)
     timer.save(run_dir / "runtime.json")
-    save_json({"component_counts": encoder.component_counts}, run_dir / "pca_summary.json")
+    save_json(_summarize_pca_encoder(encoder), run_dir / "pca_summary.json")
     return run_dir
 
 
@@ -438,6 +612,29 @@ def _select_splits(
     return make_splits(n_samples, seed=seed)
 
 
+def _select_training_subset(
+    splits: dict[str, np.ndarray],
+    dataset_cfg: dict[str, Any],
+) -> dict[str, np.ndarray]:
+    """Select a nested prefix of the full training split without moving val/test."""
+    raw_train_samples = dataset_cfg.get("train_samples")
+    copied = {
+        key: np.asarray(value, dtype=np.int64).copy()
+        for key, value in splits.items()
+    }
+    if raw_train_samples is None:
+        return copied
+    train_samples = int(raw_train_samples)
+    available = len(copied["train_idx"])
+    if train_samples <= 0 or train_samples > available:
+        raise ValueError(
+            "dataset.train_samples must be in "
+            f"[1, {available}], got {train_samples}."
+        )
+    copied["train_idx"] = copied["train_idx"][:train_samples]
+    return copied
+
+
 def _make_encoder(
     config: dict[str, Any],
     *,
@@ -478,8 +675,20 @@ def _make_encoder(
                 coarse_factor=int(two_scale_cfg.get("coarse_factor", 4)),
                 coarse_components=int(two_scale_cfg.get("coarse_components", 20)),
                 coarse_variance=float(two_scale_cfg.get("coarse_variance", 0.99)),
+                coarse_solver=str(two_scale_cfg.get("coarse_solver", "randomized")),
                 grid_size=grid_size,
                 n_samples=n_train,
+                **common,
+            )
+        context_cfg = pca_cfg.get("context_output", {})
+        if bool(context_cfg.get("enabled", False)):
+            return ContextOutputLocalToLocalPCAEncoder(
+                patch_size=int(patches_cfg["patch_size"]),
+                stride=int(patches_cfg["stride"]),
+                assembly_weights=weights,
+                include_edges=bool(patches_cfg.get("include_edges", False)),
+                output_guard_band=int(context_cfg.get("guard_band", 8)),
+                guard_padding_mode=str(context_cfg.get("padding_mode", "edge")),
                 **common,
             )
         return LocalToLocalPCAEncoder(
@@ -490,6 +699,126 @@ def _make_encoder(
             **common,
         )
     raise ValueError(f"Unsupported pca.type {pca_type!r}.")
+
+
+def _summarize_pca_encoder(encoder: Any) -> dict[str, Any]:
+    """Return solver, capacity, variance, and timing diagnostics for one encoder."""
+
+    def models_from(attribute: str, fallback: str) -> list[Any]:
+        models = getattr(encoder, attribute, None)
+        if models is not None:
+            return [model["pca"] for model in models]
+        model = getattr(encoder, fallback, None)
+        return [] if model is None else [model]
+
+    def summarize_models(models: list[Any]) -> dict[str, Any]:
+        if not models:
+            return {}
+        component_counts = [int(model.n_components_) for model in models]
+        explained = [
+            float(np.sum(np.asarray(model.explained_variance_ratio_), dtype=np.float64))
+            for model in models
+        ]
+        fitted_solvers = sorted(
+            {
+                str(getattr(model, "_fit_svd_solver", getattr(model, "svd_solver", "")))
+                for model in models
+            }
+        )
+        return {
+            "models": len(models),
+            "components_total": int(sum(component_counts)),
+            "components_min": int(min(component_counts)),
+            "components_max": int(max(component_counts)),
+            "explained_variance_ratio_min": float(min(explained)),
+            "explained_variance_ratio_mean": float(np.mean(explained)),
+            "explained_variance_ratio_max": float(max(explained)),
+            "fitted_solvers": fitted_solvers,
+        }
+
+    groups = {
+        "input": summarize_models(models_from("input_models", "input_pca")),
+        "output": summarize_models(models_from("output_models", "output_pca")),
+    }
+    coarse_pca = getattr(encoder, "coarse_pca", None)
+    if coarse_pca is not None:
+        groups["coarse_output"] = summarize_models([coarse_pca])
+        groups["output_residual"] = groups.pop("output")
+    return {
+        "component_counts": encoder.component_counts,
+        "configured_solvers": {
+            "local": str(getattr(encoder, "solver", "")),
+            "coarse": str(getattr(encoder, "coarse_solver", "")),
+        },
+        "groups": groups,
+        "timings": {
+            key: float(value)
+            for key, value in getattr(encoder, "timings", {}).items()
+        },
+    }
+
+
+def _make_latent_criterion(config: dict[str, Any], encoder: Any) -> TwoScaleLatentLoss:
+    latent_cfg = config.get("training", {}).get("latent_loss", {})
+    mode = str(latent_cfg.get("mode", "mse")).lower()
+    if mode == "mse":
+        return TwoScaleLatentLoss(mode=mode)
+    if not isinstance(encoder, TwoScaleLocalToLocalPCAEncoder):
+        raise ValueError(
+            f"training.latent_loss.mode={mode!r} requires the two-scale output representation."
+        )
+    coarse_dim = int(encoder.component_counts["coarse_output"])
+    variances = _two_scale_score_variances(encoder) if mode == "score_normalized" else None
+    return TwoScaleLatentLoss(
+        mode=mode,
+        coarse_dim=coarse_dim,
+        score_variances=None if variances is None else variances.tolist(),
+        coarse_weight=float(latent_cfg.get("coarse_weight", 0.5)),
+        residual_weight=float(latent_cfg.get("residual_weight", 0.5)),
+        variance_floor=float(latent_cfg.get("variance_floor", 1.0e-8)),
+    )
+
+
+def _two_scale_score_variances(
+    encoder: TwoScaleLocalToLocalPCAEncoder,
+) -> np.ndarray:
+    blocks = [
+        np.asarray(encoder.coarse_pca.explained_variance_, dtype=np.float64),
+        *[
+            np.asarray(model["pca"].explained_variance_, dtype=np.float64)
+            for model in encoder.output_models
+        ],
+    ]
+    variances = np.concatenate(blocks)
+    expected = int(encoder.component_counts["output_total"])
+    if variances.shape != (expected,):
+        raise ValueError(
+            f"Expected {expected} two-scale score variances, got shape {variances.shape}."
+        )
+    return variances
+
+
+def _resolved_latent_loss(config: dict[str, Any], encoder: Any) -> dict[str, Any]:
+    latent_cfg = config.get("training", {}).get("latent_loss", {})
+    mode = str(latent_cfg.get("mode", "mse")).lower()
+    resolved: dict[str, Any] = {"mode": mode}
+    if isinstance(encoder, TwoScaleLocalToLocalPCAEncoder):
+        resolved.update(
+            {
+                "coarse_dim": int(encoder.component_counts["coarse_output"]),
+                "residual_dim": int(encoder.component_counts["output_residual_total"]),
+            }
+        )
+    if mode != "mse":
+        resolved.update(
+            {
+                "coarse_weight": float(latent_cfg.get("coarse_weight", 0.5)),
+                "residual_weight": float(latent_cfg.get("residual_weight", 0.5)),
+            }
+        )
+    if mode == "score_normalized":
+        resolved["variance_floor"] = float(latent_cfg.get("variance_floor", 1.0e-8))
+    return resolved
 
 
 def _make_model(
@@ -514,7 +843,76 @@ def _make_model(
         patch_slices = getattr(encoder, "patch_slices", [])
         coupling_cfg = model_cfg.get("coupling", {})
         global_output_dim = int(counts.get("coarse_output", 0))
-        model = CouplingOperator(
+        coupling_mode = str(coupling_cfg.get("mode", "direct")).lower()
+        if coupling_mode in {"boundary_correction", "gnn_boundary_correction", "idea2"}:
+            base_model = MLP(
+                input_dim=input_dim,
+                output_dim=output_dim,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                activation=activation,
+                dropout=dropout,
+            )
+            boundary_model = GNNBoundaryCorrection(
+                base_model=base_model,
+                physical_decoder=TorchPCADecoder(encoder),
+                input_component_counts=input_counts,
+                output_component_counts=output_counts,
+                grid_shape=_patch_grid_shape(patch_slices),
+                global_output_dim=global_output_dim,
+                embed_dim=int(coupling_cfg.get("embed_dim", hidden_size)),
+                num_layers=int(coupling_cfg.get("num_layers", 3)),
+                neighborhood=int(coupling_cfg.get("neighborhood", 8)),
+                dropout=dropout,
+                activation=activation,
+                freeze_base=bool(coupling_cfg.get("freeze_base", True)),
+                boundary_width=int(coupling_cfg.get("boundary_width", 4)),
+                smooth_taper=bool(coupling_cfg.get("smooth_taper", True)),
+                correction_scale=float(coupling_cfg.get("correction_scale", coupling_cfg.get("delta_scale", 1.0))),
+                correction_regularization=float(
+                    coupling_cfg.get(
+                        "correction_regularization",
+                        coupling_cfg.get("delta_regularization", 0.0),
+                    )
+                ),
+            )
+            if boundary_model.input_dim != input_dim or boundary_model.output_dim != output_dim:
+                raise ValueError(
+                    f"Boundary correction model dimensions {boundary_model.input_dim}->{boundary_model.output_dim} "
+                    f"do not match training data {input_dim}->{output_dim}."
+                )
+            return boundary_model
+        if coupling_mode in {"interface_correction", "gnn_interface_correction", "correction"}:
+            base_model = MLP(
+                input_dim=input_dim,
+                output_dim=output_dim,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                activation=activation,
+                dropout=dropout,
+            )
+            interface_model = GNNInterfaceCorrection(
+                base_model=base_model,
+                input_component_counts=input_counts,
+                output_component_counts=output_counts,
+                grid_shape=_patch_grid_shape(patch_slices),
+                global_output_dim=global_output_dim,
+                embed_dim=int(coupling_cfg.get("embed_dim", hidden_size)),
+                num_layers=int(coupling_cfg.get("num_layers", 3)),
+                neighborhood=int(coupling_cfg.get("neighborhood", 8)),
+                dropout=dropout,
+                activation=activation,
+                freeze_base=bool(coupling_cfg.get("freeze_base", True)),
+                delta_scale=float(coupling_cfg.get("delta_scale", 1.0)),
+                delta_regularization=float(coupling_cfg.get("delta_regularization", 0.0)),
+            )
+            if interface_model.input_dim != input_dim or interface_model.output_dim != output_dim:
+                raise ValueError(
+                    f"Correction model dimensions {interface_model.input_dim}->{interface_model.output_dim} "
+                    f"do not match training data {input_dim}->{output_dim}."
+                )
+            return interface_model
+        coupling_model = CouplingOperator(
             input_component_counts=input_counts,
             output_component_counts=output_counts,
             grid_shape=_patch_grid_shape(patch_slices),
@@ -532,12 +930,12 @@ def _make_model(
             local_num_layers=int(coupling_cfg.get("local_num_layers", 2)),
             zero_init_correction=bool(coupling_cfg.get("zero_init_correction", False)),
         )
-        if model.input_dim != input_dim or model.output_dim != output_dim:
+        if coupling_model.input_dim != input_dim or coupling_model.output_dim != output_dim:
             raise ValueError(
-                f"Coupling model dimensions {model.input_dim}->{model.output_dim} "
+                f"Coupling model dimensions {coupling_model.input_dim}->{coupling_model.output_dim} "
                 f"do not match training data {input_dim}->{output_dim}."
             )
-        return model
+        return coupling_model
 
     if model_type in {"mlp", "pca_net"}:
         return MLP(
@@ -640,11 +1038,16 @@ def _compute_metrics(pred: np.ndarray, true: np.ndarray) -> dict[str, float]:
 
 def _make_in_loop_loss_config(config: dict[str, Any], grid_size: int) -> dict[str, Any]:
     loss_cfg = dict(config.get("loss", {}))
+    dataset_cfg = config.get("dataset", {})
     patches_cfg = config.get("patches", {})
     loss_cfg["patch_size"] = int(patches_cfg["patch_size"])
     loss_cfg["stride"] = int(patches_cfg["stride"])
     loss_cfg["include_edges"] = bool(patches_cfg.get("include_edges", False))
     loss_cfg["dx"] = float(loss_cfg.get("dx", 1.0 / float(grid_size - 1)))
+    loss_cfg.setdefault(
+        "poisson_convention",
+        str(dataset_cfg.get("poisson_convention", "delta_u_equals_f")),
+    )
     return loss_cfg
 
 

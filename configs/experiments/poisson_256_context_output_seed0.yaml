@@ -1,0 +1,31 @@
+experiment:
+  name: poisson_256_context_output_seed0
+  seed: 0
+  output_dir: results/poisson_256_context_output_seed0
+
+mechanisms:
+  two_scale: false
+  coupling: false
+  in_loop_loss: false
+
+dataset:
+  processed_path: data/processed/poisson_256.npz
+  grid_size: 256
+
+pca:
+  solver: randomized
+  context_output:
+    enabled: true
+    guard_band: 8
+    padding_mode: edge
+
+patches:
+  patch_size: 64
+  stride: 64
+  assembly: average
+
+training:
+  epochs: 500
+  batch_size: 32
+  eval_batch_size: 128
+  device: cuda

@@ -59,6 +59,21 @@ def test_baseline_matrix_expands_requested_models() -> None:
         assert {run.resolution for run in model_runs} == {128}
 
 
+def test_randomized_global_pca_study_expands_five_seeds() -> None:
+    root = Path(__file__).resolve().parents[1]
+    runs = expand_baseline_runs(
+        root=root,
+        dataset="poisson",
+        experiment="poisson_128_global_pca_randomized",
+    )
+
+    assert len(runs) == 5
+    assert {run.baseline_model for run in runs} == {"global_pca"}
+    assert [run.seed for run in runs] == [0, 1, 2, 3, 4]
+    assert all(run.resolution == 128 for run in runs)
+    assert all(run.config["pca"]["solver"] == "randomized" for run in runs)
+
+
 def test_warm_start_timings_are_cumulative_and_preserve_invocation(tmp_path: Path) -> None:
     source_dir = tmp_path / "two_scale"
     child_dir = tmp_path / "two_scale_in_loop"

@@ -23,6 +23,8 @@ class TorchPCADecoder(nn.Module):
         self.patch_size = int(encoder.patch_size)
         self.stride = int(encoder.stride)
         self.include_edges = bool(getattr(encoder, "include_edges", False))
+        self.output_guard_band = int(getattr(encoder, "output_guard_band", 0))
+        self.output_patch_size = int(getattr(encoder, "output_patch_size", self.patch_size))
         self.patch_decoders = nn.ModuleList(
             [_PatchPCADecoder(model) for model in encoder.output_models]
         )
@@ -60,6 +62,14 @@ class TorchPCADecoder(nn.Module):
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """Decode flat PCA output coordinates to assembled scalar fields."""
+        patch_tensor, coarse = self.decode_patches(z)
+        residual = self.assemble_patches(patch_tensor)
+        if coarse is not None:
+            return coarse + residual
+        return residual
+
+    def decode_patches(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Decode flat PCA output coordinates to patch tensors before assembly."""
         if z.ndim != 2 or z.shape[1] != self.output_dim:
             raise ValueError(f"Expected latent shape (B, {self.output_dim}), got {tuple(z.shape)}.")
         start = 0
@@ -72,15 +82,35 @@ class TorchPCADecoder(nn.Module):
         patches: list[torch.Tensor] = []
         for decoder in self.patch_decoders:
             stop = start + decoder.n_components
-            patches.append(decoder(z[:, start:stop]))
+            patch = decoder(z[:, start:stop])
+            if patch.shape[1:] != (self.patch_size, self.patch_size):
+                patch = self._crop_patch_core(patch)
+            patches.append(patch)
             start = stop
         patch_tensor = torch.stack(patches, dim=1)
-        residual = self._assemble_patches(patch_tensor)
-        if coarse is not None:
-            return coarse + residual
-        return residual
+        return patch_tensor, coarse
 
-    def _assemble_patches(self, patches: torch.Tensor) -> torch.Tensor:
+    def _crop_patch_core(self, patch: torch.Tensor) -> torch.Tensor:
+        expected = self.patch_size + 2 * self.output_guard_band
+        if self.output_guard_band <= 0 or patch.shape[1:] != (expected, expected):
+            raise ValueError(
+                f"Decoded patch shape {tuple(patch.shape[1:])} does not match "
+                f"core {(self.patch_size, self.patch_size)} or guarded {(expected, expected)}."
+            )
+        start = self.output_guard_band
+        stop = start + self.patch_size
+        return patch[:, start:stop, start:stop]
+
+    def assemble_patches(self, patches: torch.Tensor) -> torch.Tensor:
+        """Assemble decoded patch tensors with the fitted overlap/weight rule."""
+        if patches.ndim != 4:
+            raise ValueError(f"Expected patch tensor shape (B, N, P, P), got {tuple(patches.shape)}.")
+        if patches.shape[1] != len(self.patch_decoders):
+            raise ValueError(f"Expected {len(self.patch_decoders)} patches, got {patches.shape[1]}.")
+        if patches.shape[2:] != (self.patch_size, self.patch_size):
+            raise ValueError(
+                f"Expected patch size {(self.patch_size, self.patch_size)}, got {tuple(patches.shape[2:])}."
+            )
         batch_size = patches.shape[0]
         flat_indices = self.assembly_flat_indices.to(device=patches.device)
         weights = self.assembly_repeated_weights.to(dtype=patches.dtype, device=patches.device)

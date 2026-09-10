@@ -1,0 +1,16 @@
+experiment:
+  name: poisson_128_global_pca_randomized
+  seed: 0
+  output_dir: results/poisson_128_global_pca_randomized
+
+matrix:
+  output_root: results/poisson_128_global_pca_randomized
+  resolutions: [128]
+  models: [global_pca]
+  seeds: [0, 1, 2, 3, 4]
+
+pca:
+  solver: randomized
+  randomized:
+    oversampling: 20
+    n_iter: 4

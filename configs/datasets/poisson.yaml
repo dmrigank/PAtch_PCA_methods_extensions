@@ -5,3 +5,4 @@ dataset:
     - f
   output_key: u
   grid_size: 128
+  poisson_convention: delta_u_equals_f

@@ -1,0 +1,83 @@
+experiment:
+  name: svd_solver_ablation
+  seed: 0
+  output_dir: paper_results/svd_solver_ablation
+
+matrix:
+  study_type: svd_solver_ablation
+  output_root: paper_results/svd_solver_ablation
+  resolution: 128
+  processed_path: data/processed/poisson_128.npz
+  train_samples: 8000
+  seeds: [0, 1, 2, 3, 4]
+  cells:
+    - name: plain_full
+      method: plain_l2l
+      solver_class: full
+      local_solver: full
+      coarse_solver: none
+    - name: plain_randomized
+      method: plain_l2l
+      solver_class: randomized
+      local_solver: randomized
+      coarse_solver: none
+    - name: overlap_full
+      method: overlap_l2l
+      solver_class: full
+      local_solver: full
+      coarse_solver: none
+    - name: overlap_randomized
+      method: overlap_l2l
+      solver_class: randomized
+      local_solver: randomized
+      coarse_solver: none
+    - name: two_scale_full
+      method: two_scale
+      solver_class: full
+      local_solver: full
+      coarse_solver: full
+    - name: two_scale_hybrid
+      method: two_scale
+      solver_class: hybrid
+      local_solver: full
+      coarse_solver: randomized
+    - name: two_scale_randomized
+      method: two_scale
+      solver_class: randomized
+      local_solver: randomized
+      coarse_solver: randomized
+  patch_size: 32
+  plain_stride: 32
+  overlap_stride: 16
+  coarse_factor: 4
+  coarse_components: 10
+  input_variance: 0.99
+  local_output_variance: 0.99
+  residual_variance: 0.995
+  training:
+    batch_size: 32
+    epochs: 500
+    lr: 1.0e-3
+    weight_decay: 1.0e-4
+    scheduler: reduce_on_plateau
+    patience: 30
+  randomized:
+    oversampling: 20
+    n_iter: 4
+  equivalence_gates:
+    learned_mre_relative: 0.05
+    pca_oracle_mre_relative: 0.02
+    ssim_absolute: 0.001
+    secondary_metric_relative: 0.10
+    minimum_pca_speedup: 1.20
+  prediction_retention:
+    enabled: false
+
+mechanisms:
+  two_scale: false
+  coupling: false
+  in_loop_loss: false
+
+evaluation:
+  pca_oracle: true
+  validation_metrics: true

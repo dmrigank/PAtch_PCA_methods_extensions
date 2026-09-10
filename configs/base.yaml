@@ -18,6 +18,10 @@ pca:
     coarse_factor: 4
     coarse_components: 20
     coarse_variance: 0.99
+  context_output:
+    enabled: false
+    guard_band: 8
+    padding_mode: edge
   randomized:
     oversampling: 20
     n_iter: 4
@@ -34,6 +38,7 @@ model:
   activation: relu
   dropout: 0.0
   coupling:
+    mode: direct
     backend: gnn
     embed_dim: 128
     num_layers: 3
@@ -44,6 +49,9 @@ model:
     local_hidden_size: 64
     local_num_layers: 2
     zero_init_correction: false
+    freeze_base: true
+    delta_scale: 1.0
+    delta_regularization: 0.0
 
 training:
   batch_size: 32
@@ -54,6 +62,11 @@ training:
   scheduler: reduce_on_plateau
   patience: 30
   device: auto
+  latent_loss:
+    mode: mse
+    coarse_weight: 0.5
+    residual_weight: 0.5
+    variance_floor: 1.0e-8
 
 loss:
   reconstruction: relative_l2

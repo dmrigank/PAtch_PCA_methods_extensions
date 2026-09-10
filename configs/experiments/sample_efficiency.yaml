@@ -1,0 +1,51 @@
+experiment:
+  name: sample_efficiency
+  seed: 0
+  output_dir: paper_results/sample_efficiency
+
+matrix:
+  study_type: sample_efficiency
+  output_root: paper_results/sample_efficiency
+  resolution: 128
+  processed_path: data/processed/poisson_128.npz
+  sample_sizes: [1250, 2000, 4000, 8000]
+  seeds: [0, 1, 2]
+  methods:
+    - plain_l2l
+    - overlap_l2l
+    - two_scale
+    - two_scale_interface
+  pca_solver: randomized
+  patch_size: 32
+  plain_stride: 32
+  overlap_stride: 16
+  coarse_factor: 4
+  coarse_components: 10
+  residual_variance: 0.995
+  prediction_retention:
+    seeds: [0]
+    sample_sizes: [1250, 8000]
+  optimization:
+    batch_size: 32
+    reference_samples: 8000
+    latent_reference_epochs: 500
+    scheduler_patience_reference_epochs: 30
+    in_loop_reference_epochs: 50
+    reconstruction_warmup_reference_epochs: 5
+    auxiliary_ramp_reference_epochs: 10
+  interface_fine_tune:
+    lr: 1.0e-4
+    weight_decay: 0.0
+    value_target_ratio: 0.2
+    flux_target_ratio: 0.2
+    calibration_samples: 128
+    calibration_batch_size: 16
+
+mechanisms:
+  two_scale: false
+  coupling: false
+  in_loop_loss: false
+
+evaluation:
+  pca_oracle: true
+  validation_metrics: true

@@ -17,9 +17,17 @@ from lpcanet.metrics.evaluate import evaluate_run
 from lpcanet.train.experiment import train_from_config
 from lpcanet.train.factorial import (
     run_baselines,
+    run_coarse_representation_ablation,
+    run_darcy_generalization_study,
     run_factorial,
+    run_headline_poisson_study,
+    run_latent_loss_ablation,
+    run_mechanism_ablation,
     run_method_study,
+    run_physics_loss_ablation,
     run_resolution_sweep,
+    run_sample_efficiency,
+    run_svd_solver_ablation,
 )
 from lpcanet.utils.config import compose_config, save_config
 from lpcanet.utils.paths import ensure_dir
@@ -120,8 +128,16 @@ def main() -> None:
     model = args.model or selectors.get("model", "l2l")
     experiment = args.experiment or selectors.get("experiment", "single")
     if args.multirun:
-        if experiment == "baselines":
-            run_baselines(
+        composed_experiment = compose_config(
+            root=ROOT,
+            dataset=dataset,
+            model=model,
+            experiment=experiment,
+            overrides=overrides,
+        )
+        matrix = composed_experiment.get("matrix", {})
+        if matrix.get("study_type") == "darcy_generalization":
+            run_darcy_generalization_study(
                 root=ROOT,
                 dataset=dataset,
                 experiment=experiment,
@@ -134,7 +150,35 @@ def main() -> None:
                 dry_run=args.dry_run,
             )
             return
-        if experiment == "resolution_sweep":
+        if matrix.get("study_type") == "mechanism_ablation":
+            run_mechanism_ablation(
+                root=ROOT,
+                dataset=dataset,
+                experiment=experiment,
+                overrides=overrides,
+                limit_samples=args.limit_samples,
+                epochs=args.epochs,
+                output_dir=args.output_dir,
+                device=args.device,
+                overwrite=args.overwrite,
+                dry_run=args.dry_run,
+            )
+            return
+        if matrix.get("study_type") == "headline_poisson_128":
+            run_headline_poisson_study(
+                root=ROOT,
+                dataset=dataset,
+                experiment=experiment,
+                overrides=overrides,
+                limit_samples=args.limit_samples,
+                epochs=args.epochs,
+                output_dir=args.output_dir,
+                device=args.device,
+                overwrite=args.overwrite,
+                dry_run=args.dry_run,
+            )
+            return
+        if matrix.get("study_type") == "resolution_sweep":
             run_resolution_sweep(
                 root=ROOT,
                 dataset=dataset,
@@ -147,6 +191,85 @@ def main() -> None:
                 overwrite=args.overwrite,
                 dry_run=args.dry_run,
                 include_optional=args.include_optional,
+            )
+            return
+        if matrix.get("study_type") == "svd_solver_ablation":
+            run_svd_solver_ablation(
+                root=ROOT,
+                experiment=experiment,
+                overrides=overrides,
+                limit_samples=args.limit_samples,
+                epochs=args.epochs,
+                output_dir=args.output_dir,
+                device=args.device,
+                overwrite=args.overwrite,
+                dry_run=args.dry_run,
+            )
+            return
+        if matrix.get("study_type") == "sample_efficiency":
+            run_sample_efficiency(
+                root=ROOT,
+                experiment=experiment,
+                overrides=overrides,
+                limit_samples=args.limit_samples,
+                epochs=args.epochs,
+                output_dir=args.output_dir,
+                device=args.device,
+                overwrite=args.overwrite,
+                dry_run=args.dry_run,
+            )
+            return
+        if matrix.get("study_type") == "physics_loss_ablation":
+            run_physics_loss_ablation(
+                root=ROOT,
+                experiment=experiment,
+                overrides=overrides,
+                limit_samples=args.limit_samples,
+                epochs=args.epochs,
+                output_dir=args.output_dir,
+                device=args.device,
+                overwrite=args.overwrite,
+                dry_run=args.dry_run,
+            )
+            return
+        if matrix.get("study_type") == "coarse_representation_ablation":
+            run_coarse_representation_ablation(
+                root=ROOT,
+                experiment=experiment,
+                overrides=overrides,
+                limit_samples=args.limit_samples,
+                epochs=args.epochs,
+                output_dir=args.output_dir,
+                device=args.device,
+                overwrite=args.overwrite,
+                dry_run=args.dry_run,
+            )
+            return
+        if matrix.get("study_type") == "latent_loss_ablation":
+            run_latent_loss_ablation(
+                root=ROOT,
+                experiment=experiment,
+                overrides=overrides,
+                limit_samples=args.limit_samples,
+                epochs=args.epochs,
+                output_dir=args.output_dir,
+                device=args.device,
+                overwrite=args.overwrite,
+                dry_run=args.dry_run,
+            )
+            return
+        if experiment == "baselines" or "models" in matrix:
+            run_baselines(
+                root=ROOT,
+                dataset=dataset,
+                experiment=experiment,
+                overrides=overrides,
+                limit_samples=args.limit_samples,
+                epochs=args.epochs,
+                output_dir=args.output_dir,
+                device=args.device,
+                overwrite=args.overwrite,
+                dry_run=args.dry_run,
             )
             return
         if experiment in {"poisson_256_seed0", "darcy_256_seed0"}:

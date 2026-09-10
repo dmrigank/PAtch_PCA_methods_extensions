@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -26,12 +27,46 @@ METHODS = (
     ("two_scale", "Two-scale"),
     ("two_scale_in_loop", "Two-scale + in-loop"),
 )
+GNN_INTERFACE_METHOD = ("gnn_interface", "Boundary correction GNN")
+CONTEXT_OUTPUT_METHOD = ("context_output", "Context-output PCA")
 STAGE_SPECS = (
     ("pca_fit", "PCA fit", "#4C78A8"),
     ("latent_transform", "Latent transform", "#72B7B2"),
     ("nn_train", "NN training", "#F58518"),
     ("inference", "Inference", "#E45756"),
 )
+
+
+def _method_specs(
+    results_dir: Path,
+    *,
+    context_output_dir: Path | None = None,
+    gnn_interface_dir: Path | None = None,
+) -> list[tuple[str, str, Path]]:
+    specs = [
+        (method, label, _prediction_path(results_dir, method))
+        for method, label in METHODS
+    ]
+    if gnn_interface_dir is not None:
+        specs.insert(
+            2,
+            (
+                GNN_INTERFACE_METHOD[0],
+                GNN_INTERFACE_METHOD[1],
+                gnn_interface_dir / "predictions_test.npz",
+            ),
+        )
+    if context_output_dir is not None:
+        insert_at = 2
+        specs.insert(
+            insert_at,
+            (
+                CONTEXT_OUTPUT_METHOD[0],
+                CONTEXT_OUTPUT_METHOD[1],
+                context_output_dir / "predictions_test.npz",
+            ),
+        )
+    return specs
 
 
 def _prediction_path(results_dir: Path, method: str) -> Path:
@@ -76,9 +111,16 @@ def plot_reconstruction_comparison(
     output: str | Path,
     dataset: str = "poisson",
     sample_id: int | None = None,
+    context_output_dir: str | Path | None = None,
+    gnn_interface_dir: str | Path | None = None,
 ) -> list[Path]:
     """Render ground truth, reconstructions, and absolute errors for all methods."""
     results_root = Path(results_dir)
+    method_specs = _method_specs(
+        results_root,
+        context_output_dir=None if context_output_dir is None else Path(context_output_dir),
+        gnn_interface_dir=None if gnn_interface_dir is None else Path(gnn_interface_dir),
+    )
     output_path = Path(output)
     if sample_id is None:
         _, sample_id = _select_representative_sample(results_root)
@@ -90,8 +132,7 @@ def plot_reconstruction_comparison(
     input_field: np.ndarray | None = None
     truth: np.ndarray | None = None
     predictions: list[np.ndarray] = []
-    for method, _ in METHODS:
-        path = _prediction_path(results_root, method)
+    for _method, _label, path in method_specs:
         if not path.is_file():
             raise FileNotFoundError(f"Missing completed prediction file: {path}")
         method_input, method_truth, prediction = _load_sample(path, sample_id=sample_id)
@@ -130,8 +171,8 @@ def plot_reconstruction_comparison(
     )
     fig, axes = plt.subplots(
         2,
-        len(METHODS) + 1,
-        figsize=(16.2, 5.15),
+        len(method_specs) + 1,
+        figsize=(2.35 * (len(method_specs) + 1), 5.15),
         constrained_layout=True,
         squeeze=False,
     )
@@ -155,7 +196,7 @@ def plot_reconstruction_comparison(
 
     error_image = None
     for column, ((_, label), prediction, error) in enumerate(
-        zip(METHODS, predictions, errors),
+        zip([(method, label) for method, label, _ in method_specs], predictions, errors),
         start=1,
     ):
         numerator = float(np.linalg.norm((prediction - truth).ravel()))
@@ -223,6 +264,8 @@ def plot_stage_costs(
     results_dir: str | Path,
     output: str | Path,
     dataset: str,
+    context_output_dir: str | Path | None = None,
+    gnn_interface_dir: str | Path | None = None,
 ) -> list[Path]:
     """Plot cumulative end-to-end runtime split into measured pipeline stages."""
     results_root = Path(results_dir)
@@ -232,26 +275,39 @@ def plot_stage_costs(
     rows = np.genfromtxt(stage_path, delimiter=",", names=True, dtype=None, encoding="utf-8")
     rows = np.atleast_1d(rows)
     by_method = {str(row["method"]): row for row in rows}
-    missing = [method for method, _ in METHODS if method not in by_method]
+    method_specs = [(method, label) for method, label in METHODS]
+    if gnn_interface_dir is not None:
+        method_specs.insert(2, GNN_INTERFACE_METHOD)
+        by_method[GNN_INTERFACE_METHOD[0]] = _cumulative_gnn_timing_row(
+            Path(gnn_interface_dir),
+            by_method["plain_l2l"],
+        )
+    if context_output_dir is not None:
+        method_specs.insert(2, CONTEXT_OUTPUT_METHOD)
+        by_method[CONTEXT_OUTPUT_METHOD[0]] = _standalone_timing_row(
+            Path(context_output_dir),
+            CONTEXT_OUTPUT_METHOD[0],
+        )
+    missing = [method for method, _ in method_specs if method not in by_method]
     if missing:
         raise ValueError(f"Missing stage-cost rows for: {', '.join(missing)}")
 
-    labels = [label for _, label in METHODS]
-    x = np.arange(len(METHODS))
+    labels = [label for _, label in method_specs]
+    x = np.arange(len(method_specs))
     total = np.asarray(
-        [float(by_method[method]["end_to_end"]) for method, _ in METHODS],
+        [float(by_method[method]["end_to_end"]) for method, _ in method_specs],
         dtype=np.float64,
     )
     components = np.column_stack(
         [
-            [float(by_method[method][stage]) for method, _ in METHODS]
+            [float(by_method[method][stage]) for method, _ in method_specs]
             for stage, _, _ in STAGE_SPECS
         ]
     )
     overhead = np.maximum(total - np.sum(components, axis=1), 0.0)
 
     fig, ax = plt.subplots(figsize=(10.2, 5.2), constrained_layout=True)
-    bottom = np.zeros(len(METHODS), dtype=np.float64)
+    bottom = np.zeros(len(method_specs), dtype=np.float64)
     for column, (_, label, color) in enumerate(STAGE_SPECS):
         values = components[:, column]
         ax.bar(x, values, bottom=bottom, width=0.72, color=color, label=label)
@@ -281,16 +337,22 @@ def plot_qualitative_diagnostics(
     output: str | Path,
     dataset: str,
     sample_id: int | None = None,
+    context_output_dir: str | Path | None = None,
+    gnn_interface_dir: str | Path | None = None,
 ) -> list[Path]:
     """Plot truth, prediction, error, spectrum, and PDF for every method."""
     results_root = Path(results_dir)
+    method_specs = _method_specs(
+        results_root,
+        context_output_dir=None if context_output_dir is None else Path(context_output_dir),
+        gnn_interface_dir=None if gnn_interface_dir is None else Path(gnn_interface_dir),
+    )
     if sample_id is None:
         _, sample_id = _select_representative_sample(results_root)
 
     truth: np.ndarray | None = None
     predictions: list[np.ndarray] = []
-    for method, _label in METHODS:
-        path = _prediction_path(results_root, method)
+    for _method, _label, path in method_specs:
         _input, method_truth, prediction = _load_sample(path, sample_id=sample_id)
         if truth is None:
             truth = method_truth
@@ -319,9 +381,9 @@ def plot_qualitative_diagnostics(
     spectrum_k_max = min(truth.shape) // 2
 
     fig, axes = plt.subplots(
-        len(METHODS),
+        len(method_specs),
         5,
-        figsize=(13.6, 2.55 * len(METHODS)),
+        figsize=(13.6, 2.55 * len(method_specs)),
         constrained_layout=True,
         squeeze=False,
     )
@@ -330,7 +392,7 @@ def plot_qualitative_diagnostics(
         axes[0, column].set_title(title)
 
     for row, ((_method, label), prediction, error) in enumerate(
-        zip(METHODS, predictions, errors)
+        zip([(method, label) for method, label, _ in method_specs], predictions, errors)
     ):
         truth_image = axes[row, 0].imshow(
             truth,
@@ -383,7 +445,7 @@ def plot_qualitative_diagnostics(
         axes[row, 3].set_ylabel("Energy")
         _plot_sample_pdf(axes[row, 4], truth, prediction, bins=pdf_bins)
         axes[row, 4].set_ylabel("Density")
-        if row == len(METHODS) - 1:
+        if row == len(method_specs) - 1:
             axes[row, 3].set_xlabel("Wavenumber $k$")
             axes[row, 4].set_xlabel("Field value")
 
@@ -449,6 +511,44 @@ def _plot_sample_pdf(
     axis.grid(True, alpha=0.25)
 
 
+def _cumulative_gnn_timing_row(
+    gnn_interface_dir: Path,
+    base_row: np.void,
+) -> dict[str, float | str]:
+    runtime_path = gnn_interface_dir / "runtime.json"
+    if not runtime_path.is_file():
+        raise FileNotFoundError(f"Missing GNN correction runtime file: {runtime_path}")
+    with runtime_path.open("r", encoding="utf-8") as handle:
+        runtime = json.load(handle)
+    stages = runtime.get("stages", {})
+    row: dict[str, float | str] = {
+        "method": GNN_INTERFACE_METHOD[0],
+        "end_to_end": float(base_row["end_to_end"]) + float(stages.get("end_to_end", 0.0)),
+    }
+    for stage, _label, _color in STAGE_SPECS:
+        row[stage] = float(base_row[stage]) + float(stages.get(stage, 0.0))
+    return row
+
+
+def _standalone_timing_row(
+    run_dir: Path,
+    method: str,
+) -> dict[str, float | str]:
+    runtime_path = run_dir / "runtime.json"
+    if not runtime_path.is_file():
+        raise FileNotFoundError(f"Missing standalone runtime file: {runtime_path}")
+    with runtime_path.open("r", encoding="utf-8") as handle:
+        runtime = json.load(handle)
+    stages = runtime.get("stages", {})
+    row: dict[str, float | str] = {
+        "method": method,
+        "end_to_end": float(stages.get("end_to_end", 0.0)),
+    }
+    for stage, _label, _color in STAGE_SPECS:
+        row[stage] = float(stages.get(stage, 0.0))
+    return row
+
+
 def _save_figure(fig: plt.Figure, output: Path) -> list[Path]:
     output.parent.mkdir(parents=True, exist_ok=True)
     paths = [output.with_suffix(".png"), output.with_suffix(".pdf")]
@@ -481,6 +581,16 @@ def parse_args() -> argparse.Namespace:
         help="Output path without extension.",
     )
     parser.add_argument("--sample-id", type=int, default=None)
+    parser.add_argument(
+        "--context-output-dir",
+        default=None,
+        help="Optional standalone context-output PCA run to include in comparisons.",
+    )
+    parser.add_argument(
+        "--gnn-interface-dir",
+        default=None,
+        help="Optional standalone GNN interface-correction run to include in comparisons.",
+    )
     return parser.parse_args()
 
 
@@ -491,12 +601,16 @@ def main() -> None:
         output=args.output,
         dataset=args.dataset,
         sample_id=args.sample_id,
+        context_output_dir=args.context_output_dir,
+        gnn_interface_dir=args.gnn_interface_dir,
     )
     paths.extend(
         plot_stage_costs(
             results_dir=args.results_dir,
             output=_companion_output(args.output, "stage_costs"),
             dataset=args.dataset,
+            context_output_dir=args.context_output_dir,
+            gnn_interface_dir=args.gnn_interface_dir,
         )
     )
     paths.extend(
@@ -505,6 +619,8 @@ def main() -> None:
             output=_companion_output(args.output, "qualitative_diagnostics"),
             dataset=args.dataset,
             sample_id=args.sample_id,
+            context_output_dir=args.context_output_dir,
+            gnn_interface_dir=args.gnn_interface_dir,
         )
     )
     for path in paths:

@@ -1,0 +1,47 @@
+experiment:
+  name: two_scale_latent_loss_ablation
+  seed: 0
+  output_dir: paper_results/two_scale_latent_loss_ablation
+
+matrix:
+  study_type: latent_loss_ablation
+  output_root: paper_results/two_scale_latent_loss_ablation
+  n_train: 8000
+  pca_solver: randomized
+  seeds: [0]
+  latent_loss_modes:
+    - mse
+    - block_balanced
+    - score_normalized
+  datasets:
+    poisson:
+      processed_paths:
+        128: data/processed/poisson_128.npz
+        256: data/processed/poisson_256.npz
+    darcy:
+      processed_paths:
+        128: data/processed/darcy_128.npz
+        256: data/processed/darcy_256.npz
+  resolutions:
+    128:
+      patch_size: 32
+      stride: 32
+      coarse_factor: 4
+    256:
+      patch_size: 64
+      stride: 64
+      coarse_factor: 4
+
+mechanisms:
+  two_scale: true
+  coupling: false
+  in_loop_loss: false
+
+pca:
+  solver: randomized
+
+training:
+  latent_loss:
+    coarse_weight: 0.5
+    residual_weight: 0.5
+    variance_floor: 1.0e-8

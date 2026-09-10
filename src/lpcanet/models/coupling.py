@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 from torch import nn
 
@@ -178,6 +180,363 @@ class CouplingOperator(nn.Module):
         return (self.row_embedding(rows) + self.col_embedding(cols)).unsqueeze(0)
 
 
+class GNNInterfaceCorrection(nn.Module):
+    """Zero-initialized GNN correction on top of a trained local L2L model.
+
+    The wrapped ``base_model`` predicts the usual patch-latent output. A GNN then
+    receives, for each patch, the local input code and the base output code and
+    predicts a small residual correction in output-latent space. This makes the
+    coupling path a seam/interface corrector rather than a replacement predictor.
+    """
+
+    def __init__(
+        self,
+        *,
+        base_model: nn.Module,
+        input_component_counts: list[int],
+        output_component_counts: list[int],
+        grid_shape: tuple[int, int],
+        global_output_dim: int = 0,
+        embed_dim: int = 128,
+        num_layers: int = 3,
+        neighborhood: int = 8,
+        dropout: float = 0.0,
+        activation: str = "gelu",
+        freeze_base: bool = True,
+        delta_scale: float = 1.0,
+        delta_regularization: float = 0.0,
+    ) -> None:
+        super().__init__()
+        rows, cols = _validate_grid(grid_shape)
+        if rows * cols != len(input_component_counts):
+            raise ValueError(
+                f"grid_shape={grid_shape} implies {rows * cols} patches, "
+                f"got {len(input_component_counts)} input counts."
+            )
+        if len(input_component_counts) != len(output_component_counts):
+            raise ValueError("Input and output component count lists must have the same length.")
+        if any(count <= 0 for count in input_component_counts + output_component_counts):
+            raise ValueError("All component counts must be positive.")
+        if global_output_dim < 0:
+            raise ValueError("global_output_dim cannot be negative.")
+        if delta_scale <= 0.0:
+            raise ValueError("delta_scale must be positive.")
+        if delta_regularization < 0.0:
+            raise ValueError("delta_regularization must be non-negative.")
+
+        self.base_model = base_model
+        self.input_component_counts = [int(count) for count in input_component_counts]
+        self.output_component_counts = [int(count) for count in output_component_counts]
+        self.grid_shape = (rows, cols)
+        self.num_patches = rows * cols
+        self.global_output_dim = int(global_output_dim)
+        self.embed_dim = int(embed_dim)
+        self.input_dim = int(sum(self.input_component_counts))
+        self.output_dim = int(self.global_output_dim + sum(self.output_component_counts))
+        self.freeze_base = bool(freeze_base)
+        self.delta_scale = float(delta_scale)
+        self.delta_regularization = float(delta_regularization)
+        self._last_delta: torch.Tensor | None = None
+
+        if self.freeze_base:
+            for parameter in self.base_model.parameters():
+                parameter.requires_grad_(False)
+
+        self.node_encoders = nn.ModuleList(
+            [
+                nn.Linear(input_width + output_width, self.embed_dim)
+                for input_width, output_width in zip(
+                    self.input_component_counts,
+                    self.output_component_counts,
+                )
+            ]
+        )
+        self.output_decoders = nn.ModuleList(
+            [nn.Linear(self.embed_dim, width) for width in self.output_component_counts]
+        )
+        for decoder in self.output_decoders:
+            nn.init.zeros_(decoder.weight)
+            nn.init.zeros_(decoder.bias)
+
+        self.global_decoder = (
+            nn.Linear(self.embed_dim, self.global_output_dim)
+            if self.global_output_dim > 0
+            else None
+        )
+        if self.global_decoder is not None:
+            nn.init.zeros_(self.global_decoder.weight)
+            nn.init.zeros_(self.global_decoder.bias)
+
+        self.row_embedding = nn.Embedding(rows, self.embed_dim)
+        self.col_embedding = nn.Embedding(cols, self.embed_dim)
+        positions = torch.tensor(
+            [(row, col) for row in range(rows) for col in range(cols)],
+            dtype=torch.long,
+        )
+        self.register_buffer("positions", positions, persistent=False)
+        self.register_buffer(
+            "edge_index",
+            _patch_edge_index((rows, cols), neighborhood),
+            persistent=False,
+        )
+        self.backend = GNNCouplingBackend(
+            embed_dim=self.embed_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+            activation=activation,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return ``base_model(x) + delta`` in flat latent-output coordinates."""
+        if x.ndim != 2 or x.shape[1] != self.input_dim:
+            raise ValueError(f"Expected flat input shape (B, {self.input_dim}), got {tuple(x.shape)}.")
+        with torch.set_grad_enabled(not self.freeze_base):
+            base = self.base_model(x)
+        if base.ndim != 2 or base.shape[1] != self.output_dim:
+            raise ValueError(
+                f"Base model must return shape (B, {self.output_dim}), got {tuple(base.shape)}."
+            )
+
+        input_pieces = _split_flat(x, self.input_component_counts)
+        local_base = base[:, self.global_output_dim:]
+        base_pieces = _split_flat(local_base, self.output_component_counts)
+        tokens = torch.stack(
+            [
+                encoder(torch.cat([input_piece, base_piece], dim=1))
+                for encoder, input_piece, base_piece in zip(
+                    self.node_encoders,
+                    input_pieces,
+                    base_pieces,
+                )
+            ],
+            dim=1,
+        )
+        tokens = tokens + self._positional_embedding()
+        coupled = self.backend(tokens, self.edge_index)
+
+        delta_pieces: list[torch.Tensor] = []
+        if self.global_decoder is not None:
+            delta_pieces.append(self.global_decoder(torch.mean(coupled, dim=1)))
+        for patch_index, decoder in enumerate(self.output_decoders):
+            delta_pieces.append(decoder(coupled[:, patch_index, :]))
+        delta = torch.cat(delta_pieces, dim=1) * self.delta_scale
+        self._last_delta = delta
+        return base + delta
+
+    def regularization_loss(self) -> torch.Tensor:
+        """Return latent correction magnitude penalty for the last forward pass."""
+        if self._last_delta is None or self.delta_regularization == 0.0:
+            parameter = next(self.parameters())
+            return parameter.sum() * 0.0
+        return self.delta_regularization * torch.mean(self._last_delta**2)
+
+    def load_warm_start_state(self, state_dict: dict[str, torch.Tensor]) -> None:
+        """Load a plain L2L state dict into the wrapped base model."""
+        self.base_model.load_state_dict(state_dict)
+
+    def _positional_embedding(self) -> torch.Tensor:
+        rows = self.positions[:, 0]
+        cols = self.positions[:, 1]
+        return (self.row_embedding(rows) + self.col_embedding(cols)).unsqueeze(0)
+
+
+class GNNBoundaryCorrection(nn.Module):
+    """GNN-driven masked boundary-band correction in physical patch space.
+
+    The wrapped base model produces the standard local PCA latent prediction.
+    Those latents are decoded by the provided PCA decoder to patch pixels, then a
+    GNN emits a small additive correction image for each patch. The correction is
+    multiplied by a fixed boundary-ring mask before assembly, matching the
+    boundary-correction coupling idea: the new parameters can affect seams
+    directly without competing with the PCA core in the patch interior.
+    """
+
+    def __init__(
+        self,
+        *,
+        base_model: nn.Module,
+        physical_decoder: Any,
+        input_component_counts: list[int],
+        output_component_counts: list[int],
+        grid_shape: tuple[int, int],
+        global_output_dim: int = 0,
+        embed_dim: int = 128,
+        num_layers: int = 3,
+        neighborhood: int = 8,
+        dropout: float = 0.0,
+        activation: str = "gelu",
+        freeze_base: bool = True,
+        boundary_width: int = 4,
+        smooth_taper: bool = True,
+        correction_scale: float = 1.0,
+        correction_regularization: float = 0.0,
+    ) -> None:
+        super().__init__()
+        rows, cols = _validate_grid(grid_shape)
+        if rows * cols != len(input_component_counts):
+            raise ValueError(
+                f"grid_shape={grid_shape} implies {rows * cols} patches, "
+                f"got {len(input_component_counts)} input counts."
+            )
+        if len(input_component_counts) != len(output_component_counts):
+            raise ValueError("Input and output component count lists must have the same length.")
+        if any(count <= 0 for count in input_component_counts + output_component_counts):
+            raise ValueError("All component counts must be positive.")
+        if global_output_dim < 0:
+            raise ValueError("global_output_dim cannot be negative.")
+        patch_size = int(getattr(physical_decoder, "patch_size", 0))
+        if patch_size <= 0:
+            raise ValueError("physical_decoder must expose a positive patch_size.")
+        if boundary_width <= 0 or boundary_width * 2 >= patch_size:
+            raise ValueError("boundary_width must be positive and smaller than half the patch size.")
+        if correction_scale <= 0.0:
+            raise ValueError("correction_scale must be positive.")
+        if correction_regularization < 0.0:
+            raise ValueError("correction_regularization must be non-negative.")
+
+        self.base_model = base_model
+        self.physical_decoder = physical_decoder
+        self.input_component_counts = [int(count) for count in input_component_counts]
+        self.output_component_counts = [int(count) for count in output_component_counts]
+        self.grid_shape = (rows, cols)
+        self.num_patches = rows * cols
+        self.global_output_dim = int(global_output_dim)
+        self.embed_dim = int(embed_dim)
+        self.input_dim = int(sum(self.input_component_counts))
+        self.output_dim = int(self.global_output_dim + sum(self.output_component_counts))
+        self.patch_size = patch_size
+        self.boundary_width = int(boundary_width)
+        self.freeze_base = bool(freeze_base)
+        self.correction_scale = float(correction_scale)
+        self.correction_regularization = float(correction_regularization)
+        self._last_correction: torch.Tensor | None = None
+
+        if self.freeze_base:
+            for parameter in self.base_model.parameters():
+                parameter.requires_grad_(False)
+        for parameter in self.physical_decoder.parameters():
+            parameter.requires_grad_(False)
+
+        self.node_encoders = nn.ModuleList(
+            [
+                nn.Linear(input_width + output_width, self.embed_dim)
+                for input_width, output_width in zip(
+                    self.input_component_counts,
+                    self.output_component_counts,
+                )
+            ]
+        )
+        patch_pixels = self.patch_size * self.patch_size
+        self.boundary_decoders = nn.ModuleList(
+            [nn.Linear(self.embed_dim, patch_pixels) for _ in self.output_component_counts]
+        )
+        for decoder in self.boundary_decoders:
+            nn.init.zeros_(decoder.weight)
+            nn.init.zeros_(decoder.bias)
+
+        self.row_embedding = nn.Embedding(rows, self.embed_dim)
+        self.col_embedding = nn.Embedding(cols, self.embed_dim)
+        positions = torch.tensor(
+            [(row, col) for row in range(rows) for col in range(cols)],
+            dtype=torch.long,
+        )
+        self.register_buffer("positions", positions, persistent=False)
+        self.register_buffer(
+            "edge_index",
+            _patch_edge_index((rows, cols), neighborhood),
+            persistent=False,
+        )
+        self.register_buffer(
+            "boundary_mask",
+            _boundary_ring_mask(self.patch_size, self.boundary_width, smooth_taper),
+            persistent=False,
+        )
+        self.backend = GNNCouplingBackend(
+            embed_dim=self.embed_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+            activation=activation,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the base latent prediction for latent-space callers."""
+        return self._base_latent(x)
+
+    def predict_physical(self, x: torch.Tensor) -> torch.Tensor:
+        """Decode the base PCA core and add masked boundary corrections."""
+        base = self._base_latent(x)
+        patches, coarse = self.physical_decoder.decode_patches(base)
+        correction = self._boundary_correction(x, base, dtype=patches.dtype, device=patches.device)
+        corrected_patches = patches + correction
+        residual = self.physical_decoder.assemble_patches(corrected_patches)
+        if coarse is not None:
+            return coarse + residual
+        return residual
+
+    def regularization_loss(self) -> torch.Tensor:
+        """Return boundary correction magnitude penalty for the last forward pass."""
+        if self._last_correction is None or self.correction_regularization == 0.0:
+            parameter = next(self.parameters())
+            return parameter.sum() * 0.0
+        return self.correction_regularization * torch.mean(self._last_correction**2)
+
+    def load_warm_start_state(self, state_dict: dict[str, torch.Tensor]) -> None:
+        """Load a plain L2L state dict into the wrapped base model."""
+        self.base_model.load_state_dict(state_dict)
+
+    def _base_latent(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 2 or x.shape[1] != self.input_dim:
+            raise ValueError(f"Expected flat input shape (B, {self.input_dim}), got {tuple(x.shape)}.")
+        if self.freeze_base:
+            self.base_model.eval()
+        with torch.set_grad_enabled(not self.freeze_base):
+            base = self.base_model(x)
+        if base.ndim != 2 or base.shape[1] != self.output_dim:
+            raise ValueError(
+                f"Base model must return shape (B, {self.output_dim}), got {tuple(base.shape)}."
+            )
+        return base
+
+    def _boundary_correction(
+        self,
+        x: torch.Tensor,
+        base: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        input_pieces = _split_flat(x, self.input_component_counts)
+        local_base = base[:, self.global_output_dim:]
+        base_pieces = _split_flat(local_base, self.output_component_counts)
+        tokens = torch.stack(
+            [
+                encoder(torch.cat([input_piece, base_piece], dim=1))
+                for encoder, input_piece, base_piece in zip(
+                    self.node_encoders,
+                    input_pieces,
+                    base_pieces,
+                )
+            ],
+            dim=1,
+        )
+        tokens = tokens + self._positional_embedding()
+        coupled = self.backend(tokens, self.edge_index)
+        corrections = [
+            decoder(coupled[:, patch_index, :]).reshape(x.shape[0], self.patch_size, self.patch_size)
+            for patch_index, decoder in enumerate(self.boundary_decoders)
+        ]
+        correction = torch.stack(corrections, dim=1)
+        mask = self.boundary_mask.to(dtype=dtype, device=device)
+        correction = correction.to(dtype=dtype, device=device) * mask * self.correction_scale
+        self._last_correction = correction
+        return correction
+
+    def _positional_embedding(self) -> torch.Tensor:
+        rows = self.positions[:, 0]
+        cols = self.positions[:, 1]
+        return (self.row_embedding(rows) + self.col_embedding(cols)).unsqueeze(0)
+
+
 class GNNCouplingBackend(nn.Module):
     """Residual message-passing backend over a patch adjacency graph."""
 
@@ -287,3 +646,27 @@ def _patch_edge_index(grid_shape: tuple[int, int], neighborhood: int) -> torch.T
     if not edges:
         return torch.empty((2, 0), dtype=torch.long)
     return torch.tensor(edges, dtype=torch.long).t().contiguous()
+
+
+def _boundary_ring_mask(patch_size: int, boundary_width: int, smooth_taper: bool) -> torch.Tensor:
+    coords = torch.arange(patch_size, dtype=torch.float32)
+    row_distance = torch.minimum(coords, torch.flip(coords, dims=(0,))).reshape(-1, 1)
+    col_distance = torch.minimum(coords, torch.flip(coords, dims=(0,))).reshape(1, -1)
+    distance = torch.minimum(row_distance, col_distance)
+    if smooth_taper:
+        mask = ((float(boundary_width) - distance) / float(boundary_width)).clamp(min=0.0, max=1.0)
+    else:
+        mask = (distance < float(boundary_width)).to(torch.float32)
+    return mask.reshape(1, 1, patch_size, patch_size)
+
+
+def _split_flat(x: torch.Tensor, widths: list[int]) -> list[torch.Tensor]:
+    pieces: list[torch.Tensor] = []
+    start = 0
+    for width in widths:
+        stop = start + int(width)
+        pieces.append(x[:, start:stop])
+        start = stop
+    if start != x.shape[1]:
+        raise ValueError(f"Widths sum to {start}, but tensor has width {x.shape[1]}.")
+    return pieces

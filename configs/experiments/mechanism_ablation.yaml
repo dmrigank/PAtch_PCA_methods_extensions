@@ -1,0 +1,75 @@
+experiment:
+  name: mechanism_ablation
+  seed: 0
+  output_dir: paper_results/mechanism_ablation
+
+matrix:
+  study_type: mechanism_ablation
+  output_root: paper_results/mechanism_ablation
+  n_train: 8000
+  seeds: [0, 1, 2, 3, 4]
+  # These core cells are resolved through the controlled resolution-study path.
+  methods:
+    - global_pca
+    - plain_l2l
+    - overlap_l2l
+    - two_scale
+    - two_scale_interface
+    - fno
+  mechanism_methods:
+    - plain_l2l
+    - plain_l2l_interface
+    - two_scale
+    - two_scale_interface
+    - overlap_l2l
+  processed_paths:
+    128: data/processed/poisson_128.npz
+  resolutions:
+    128:
+      patch_size: 32
+      plain_stride: 32
+      overlap_stride: 16
+      coarse_factor: 4
+  representation:
+    solver: randomized
+    input_variance: 0.99
+    local_output_variance: 0.99
+    residual_variance: 0.995
+    coarse_components: 10
+    coarse_variance: 1.0
+    randomized_oversampling: 20
+    randomized_n_iter: 4
+  latent_training:
+    batch_size: 32
+    eval_batch_size: 256
+    epochs: 500
+    lr: 1.0e-3
+    weight_decay: 1.0e-4
+    scheduler: reduce_on_plateau
+    patience: 30
+  interface_fine_tune:
+    epochs: 50
+    lr: 1.0e-4
+    weight_decay: 0.0
+    scheduler: none
+    reconstruction_epochs: 5
+    ramp_epochs: 10
+    value_target_ratio: 0.2
+    flux_target_ratio: 0.2
+    calibration_batch_size: 16
+    calibration_samples: 128
+  fno_training:
+    batch_size: 16
+    eval_batch_size: 64
+    epochs: 100
+    lr: 1.0e-3
+    weight_decay: 0.0
+    scheduler: reduce_on_plateau
+    patience: 5
+    early_stopping:
+      enabled: true
+      patience: 15
+      min_delta: 0.0
+  prediction_retention:
+    seeds: [0]
+    resolutions: [128]

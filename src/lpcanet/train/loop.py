@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -23,6 +23,8 @@ class TrainingResult:
     best_val_loss: float
     epochs_ran: int
     stopped_early: bool
+    train_components: dict[str, np.ndarray] = field(default_factory=dict)
+    val_components: dict[str, np.ndarray] = field(default_factory=dict)
 
 
 def train_latent_model(
@@ -41,6 +43,7 @@ def train_latent_model(
     patience: int = 30,
     early_stopping_patience: int | None = None,
     early_stopping_min_delta: float = 0.0,
+    criterion: nn.Module | None = None,
 ) -> TrainingResult:
     """Train a latent-space model and keep the best validation checkpoint."""
     if epochs <= 0:
@@ -54,7 +57,8 @@ def train_latent_model(
 
     device = torch.device(device)
     model.to(device)
-    criterion = nn.MSELoss()
+    criterion = nn.MSELoss() if criterion is None else criterion
+    criterion.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     lr_scheduler = None
     if scheduler == "reduce_on_plateau":
@@ -176,6 +180,8 @@ def train_in_loop_physical_model(
 
     train_losses: list[float] = []
     val_losses: list[float] = []
+    train_component_losses: dict[str, list[float]] = {}
+    val_component_losses: dict[str, list[float]] = {}
     best_val_loss = float("inf")
     best_state: dict[str, torch.Tensor] | None = None
     schedule = LossWarmupSchedule(loss_config)
@@ -190,17 +196,18 @@ def train_in_loop_physical_model(
         weights = schedule.weights_for_epoch(epoch_index)
         criterion = _make_composite_loss(loss_config, weights)
         model.train()
-        train_loss = _run_physical_epoch(
+        train_loss, train_components = _run_physical_epoch(
             model,
             decoder,
             train_loader,
             criterion,
             device,
             optimizer=optimizer,
+            component_criterion=validation_criterion,
         )
         model.eval()
         with torch.no_grad():
-            val_loss = _run_physical_epoch(
+            val_loss, val_components = _run_physical_epoch(
                 model,
                 decoder,
                 val_loader,
@@ -211,6 +218,8 @@ def train_in_loop_physical_model(
 
         train_losses.append(train_loss)
         val_losses.append(val_loss)
+        _append_component_losses(train_component_losses, train_components)
+        _append_component_losses(val_component_losses, val_components)
         if lr_scheduler is not None:
             lr_scheduler.step(val_loss)
 
@@ -234,7 +243,102 @@ def train_in_loop_physical_model(
         best_val_loss=float(best_val_loss),
         epochs_ran=len(train_losses),
         stopped_early=False,
+        train_components={
+            name: np.asarray(values, dtype=np.float32)
+            for name, values in train_component_losses.items()
+        },
+        val_components={
+            name: np.asarray(values, dtype=np.float32)
+            for name, values in val_component_losses.items()
+        },
     )
+
+
+def calibrate_physical_loss_weights(
+    model: nn.Module,
+    decoder: nn.Module,
+    x_val_latent: np.ndarray,
+    y_val: np.ndarray,
+    *,
+    forcing_val: np.ndarray | None = None,
+    coefficient_val: np.ndarray | None = None,
+    loss_config: dict[str, Any],
+    target_ratios: dict[str, float],
+    device: str | torch.device = "cpu",
+    batch_size: int = 32,
+    max_samples: int = 128,
+    minimum_weight: float = 1.0e-12,
+    maximum_weight: float = 1.0e6,
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Scale active auxiliary terms to target fractions of reconstruction loss."""
+    if max_samples <= 0:
+        raise ValueError("max_samples must be positive.")
+    if minimum_weight <= 0.0 or maximum_weight < minimum_weight:
+        raise ValueError("Loss-calibration weight bounds are invalid.")
+    active_terms = set(loss_config.get("active_terms", ["recon"]))
+    active_terms.add("recon")
+    term_names = (
+        "recon",
+        "interface_value",
+        "interface_flux",
+        "pde_residual",
+        "spectral",
+    )
+    calibration_weights = {
+        name: 1.0 if name in active_terms else 0.0 for name in term_names
+    }
+    criterion = _make_composite_loss(loss_config, calibration_weights)
+    count = min(int(max_samples), len(y_val))
+    loader = _make_physical_loader(
+        x_val_latent[:count],
+        y_val[:count],
+        None if forcing_val is None else forcing_val[:count],
+        None if coefficient_val is None else coefficient_val[:count],
+        batch_size=min(int(batch_size), count),
+        shuffle=False,
+    )
+    device_obj = torch.device(device)
+    model.to(device_obj)
+    decoder.to(device_obj)
+    criterion.to(device_obj)
+    model.eval()
+    decoder.eval()
+    with torch.no_grad():
+        _, components = _run_physical_epoch(
+            model,
+            decoder,
+            loader,
+            criterion,
+            device_obj,
+            optimizer=None,
+        )
+    reconstruction = float(components.get("recon", 0.0))
+    if not np.isfinite(reconstruction) or reconstruction <= 0.0:
+        raise ValueError(
+            f"Cannot calibrate physical losses from reconstruction value {reconstruction}."
+        )
+
+    calibrated = dict(loss_config.get("weights", {}))
+    calibrated["recon"] = float(calibrated.get("recon", 1.0))
+    for term in active_terms - {"recon"}:
+        ratio = float(target_ratios.get(term, 0.0))
+        component = float(components.get(term, 0.0))
+        if ratio < 0.0:
+            raise ValueError(f"Target ratio for {term} must be non-negative.")
+        if ratio == 0.0:
+            calibrated[term] = 0.0
+            continue
+        if not np.isfinite(component) or component <= 0.0:
+            raise ValueError(f"Cannot calibrate {term} from component value {component}.")
+        raw_weight = ratio * reconstruction / component
+        calibrated[term] = float(
+            min(max(raw_weight, minimum_weight), maximum_weight)
+        )
+    for term in term_names:
+        calibrated.setdefault(term, 0.0)
+        if term not in active_terms:
+            calibrated[term] = 0.0
+    return calibrated, components
 
 
 def predict_latent(
@@ -255,6 +359,34 @@ def predict_latent(
         for (x_batch,) in loader:
             pred = model(x_batch.to(device)).detach().cpu().numpy()
             outputs.append(pred)
+    return np.concatenate(outputs, axis=0).astype(np.float32, copy=False)
+
+
+def predict_physical_fields(
+    model: nn.Module,
+    decoder: nn.Module,
+    x: np.ndarray,
+    *,
+    device: str | torch.device = "cpu",
+    batch_size: int = 256,
+) -> np.ndarray:
+    """Run a model and return assembled physical fields."""
+    device = torch.device(device)
+    model.to(device)
+    decoder.to(device)
+    model.eval()
+    decoder.eval()
+    dataset = TensorDataset(torch.from_numpy(np.asarray(x, dtype=np.float32)))
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    outputs: list[np.ndarray] = []
+    with torch.no_grad():
+        for (x_batch,) in loader:
+            x_device = x_batch.to(device)
+            if hasattr(model, "predict_physical"):
+                pred = cast(Any, model).predict_physical(x_device)
+            else:
+                pred = decoder(model(x_device))
+            outputs.append(pred.detach().cpu().numpy())
     return np.concatenate(outputs, axis=0).astype(np.float32, copy=False)
 
 
@@ -396,6 +528,9 @@ def _make_composite_loss(loss_config: dict[str, Any], weights: dict[str, float])
         include_edges=bool(loss_config.get("include_edges", False)),
         pde=str(loss_config.get("pde", "poisson")),
         pde_reduction=str(loss_config.get("pde_reduction", "rms")),
+        poisson_convention=str(
+            loss_config.get("poisson_convention", "delta_u_equals_f")
+        ),
         spectral_high_k_weight_power=float(loss_config.get("spectral_high_k_weight_power", 1.0)),
         interface_target=str(loss_config.get("interface_target", "zero")),
     )
@@ -445,9 +580,11 @@ def _run_physical_epoch(
     device: torch.device,
     *,
     optimizer: torch.optim.Optimizer | None,
-) -> float:
+    component_criterion: CompositeLoss | None = None,
+) -> tuple[float, dict[str, float]]:
     total_loss = 0.0
     total_count = 0
+    component_totals: dict[str, float] = {}
     for x_batch, y_batch, forcing_batch, coefficient_batch in loader:
         x_batch = x_batch.to(device)
         y_batch = y_batch.to(device)
@@ -455,22 +592,64 @@ def _run_physical_epoch(
         coefficient_arg = _optional_batch(coefficient_batch, device)
         if optimizer is not None:
             optimizer.zero_grad()
-        pred_latent = model(x_batch)
-        pred_field = decoder(pred_latent)
-        loss = criterion(
-            pred_field,
-            y_batch,
-            forcing=forcing_arg,
-            coefficient=coefficient_arg,
-        )
+        if hasattr(model, "predict_physical"):
+            pred_field = cast(Any, model).predict_physical(x_batch)
+        else:
+            pred_latent = model(x_batch)
+            pred_field = decoder(pred_latent)
+        if component_criterion is None or component_criterion is criterion:
+            loss_result = criterion(
+                pred_field,
+                y_batch,
+                forcing=forcing_arg,
+                coefficient=coefficient_arg,
+                return_components=True,
+            )
+            assert isinstance(loss_result, tuple)
+            loss, components = loss_result
+        else:
+            loss = criterion(
+                pred_field,
+                y_batch,
+                forcing=forcing_arg,
+                coefficient=coefficient_arg,
+            )
+            assert isinstance(loss, torch.Tensor)
+            component_result = component_criterion(
+                pred_field,
+                y_batch,
+                forcing=forcing_arg,
+                coefficient=coefficient_arg,
+                return_components=True,
+            )
+            assert isinstance(component_result, tuple)
+            _, components = component_result
+        if hasattr(model, "regularization_loss"):
+            loss = loss + model.regularization_loss()
         if optimizer is not None:
             loss.backward()
             optimizer.step()
         total_loss += float(loss.item()) * x_batch.shape[0]
+        for name, value in components.items():
+            component_totals[name] = (
+                component_totals.get(name, 0.0)
+                + float(value.item()) * x_batch.shape[0]
+            )
         total_count += int(x_batch.shape[0])
     if total_count == 0:
         raise ValueError("Cannot train/evaluate on an empty dataset.")
-    return total_loss / total_count
+    return (
+        total_loss / total_count,
+        {name: value / total_count for name, value in component_totals.items()},
+    )
+
+
+def _append_component_losses(
+    history: dict[str, list[float]],
+    components: dict[str, float],
+) -> None:
+    for name, value in components.items():
+        history.setdefault(name, []).append(float(value))
 
 
 def _optional_batch(batch: torch.Tensor, device: torch.device) -> torch.Tensor | None:

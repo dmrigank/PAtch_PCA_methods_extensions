@@ -37,6 +37,12 @@ def test_in_loop_training_reduces_spectral_and_interface_metrics(tmp_path: Path)
         runtime = json.load(handle)
     assert "refinement" not in runtime["times"]
     assert "postprocess" not in runtime["times"]
+    assert (in_loop_dir / "validation_metrics.json").is_file()
+    with np.load(in_loop_dir / "loss_curves.npz", allow_pickle=False) as curves:
+        assert "train_component_recon" in curves
+        assert "val_component_spectral" in curves
+        assert len(curves["train_component_spectral"]) == len(curves["train_loss"])
+        assert len(curves["val_component_spectral"]) == len(curves["val_loss"])
 
 
 def _run_case(
@@ -81,7 +87,9 @@ def _run_case(
         "mre",
         "relative_spectrum_error",
         "interface_jump",
+        "interface_value_trace_error",
     ]
+    config["evaluation"]["validation_metrics"] = True
     config["loss"]["reconstruction"] = "mse"
     config["loss"]["active_terms"] = ["recon", "interface_value", "interface_flux", "spectral"]
     config["loss"]["weights"] = {

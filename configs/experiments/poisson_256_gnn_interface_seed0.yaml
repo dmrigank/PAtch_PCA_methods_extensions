@@ -1,0 +1,66 @@
+experiment:
+  name: poisson_256_gnn_interface_seed0
+  seed: 0
+  output_dir: results/poisson_256_gnn_interface_seed0
+
+mechanisms:
+  two_scale: false
+  coupling: true
+  in_loop_loss: true
+
+warm_start:
+  enabled: true
+  run_dir: results/poisson_256_seed0/resolution_256/plain_l2l/seed_0
+
+dataset:
+  processed_path: data/processed/poisson_256.npz
+  grid_size: 256
+
+pca:
+  solver: randomized
+
+patches:
+  patch_size: 64
+  stride: 64
+  assembly: average
+
+model:
+  coupling:
+    mode: boundary_correction
+    backend: gnn
+    embed_dim: 96
+    num_layers: 3
+    neighborhood: 8
+    freeze_base: true
+    boundary_width: 8
+    smooth_taper: true
+    correction_scale: 1.0
+    correction_regularization: 1.0e-4
+
+training:
+  epochs: 80
+  lr: 3.0e-4
+  weight_decay: 0.0
+  scheduler: reduce_on_plateau
+  patience: 12
+  batch_size: 16
+  eval_batch_size: 128
+  device: cuda
+
+loss:
+  reconstruction: relative_l2
+  interface_target: truth
+  active_terms:
+    - recon
+    - interface_value
+    - interface_flux
+    - spectral
+  weights:
+    recon: 1.0
+    interface_value: 3.0
+    interface_flux: 0.02
+    pde_residual: 0.0
+    spectral: 0.01
+  warmup:
+    reconstruction_epochs: 2
+    ramp_epochs: 8

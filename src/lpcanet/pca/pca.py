@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from time import perf_counter
-from typing import Any
+from typing import Any, cast
 
 import joblib
 import numpy as np
@@ -418,6 +418,152 @@ class LocalToLocalPCAEncoder(BasePCAEncoder):
         return result.astype(np.float32, copy=False)
 
 
+class ContextOutputLocalToLocalPCAEncoder(LocalToLocalPCAEncoder):
+    """L2L PCA with normal input patches and guarded-context output PCA.
+
+    Output PCA bases are fit/transformed on ``patch_size + 2 * guard_band``
+    windows, but decoded guarded patches are cropped back to the central
+    ``patch_size`` core before normal disjoint/weighted assembly.
+    """
+
+    def __init__(
+        self,
+        patch_size: int,
+        stride: int,
+        input_variance: int | float = 0.99,
+        output_variance: int | float = 0.99,
+        solver: str = "full",
+        standardize: bool = True,
+        oversampling: int = 20,
+        n_iter: int = 4,
+        random_state: int | None = None,
+        assembly_weights: np.ndarray | None = None,
+        include_edges: bool = False,
+        output_guard_band: int = 8,
+        guard_padding_mode: str = "edge",
+    ) -> None:
+        super().__init__(
+            patch_size=patch_size,
+            stride=stride,
+            input_variance=input_variance,
+            output_variance=output_variance,
+            solver=solver,
+            standardize=standardize,
+            oversampling=oversampling,
+            n_iter=n_iter,
+            random_state=random_state,
+            assembly_weights=assembly_weights,
+            include_edges=include_edges,
+        )
+        if output_guard_band <= 0:
+            raise ValueError("output_guard_band must be positive.")
+        self.output_guard_band = int(output_guard_band)
+        self.output_patch_size = int(patch_size) + 2 * self.output_guard_band
+        self.guard_padding_mode = str(guard_padding_mode)
+
+    def fit(self, x_train: np.ndarray, y_train: np.ndarray) -> ContextOutputLocalToLocalPCAEncoder:
+        """Fit normal input PCA and guarded-context output PCA models."""
+        self.grid_shape = _field_grid_shape(x_train)
+        self.output_shape_ = _field_grid_shape(y_train)
+        if self.grid_shape != self.output_shape_:
+            raise ValueError(
+                f"Input/output grids must match for context-output L2L PCA, got "
+                f"{self.grid_shape} and {self.output_shape_}."
+            )
+        self.patch_slices = get_patch_slices(
+            self.grid_shape,
+            self.patch_size,
+            self.stride,
+            include_edges=self.include_edges,
+        )
+        x_patches = extract_patches_2d(
+            x_train,
+            self.patch_size,
+            self.stride,
+            flatten=True,
+            include_edges=self.include_edges,
+        )
+        y_context_patches = _extract_guarded_patches_2d(
+            y_train,
+            self.patch_slices,
+            self.output_guard_band,
+            padding_mode=self.guard_padding_mode,
+            flatten=True,
+        )
+
+        start = perf_counter()
+        self.input_models = _fit_patch_models(self, x_patches, self.input_variance)
+        self.timings["fit_input_pca"] = perf_counter() - start
+
+        start = perf_counter()
+        self.output_models = _fit_patch_models(self, y_context_patches, self.output_variance)
+        self.timings["fit_output_pca"] = perf_counter() - start
+
+        input_counts = [int(model["pca"].n_components_) for model in self.input_models]
+        output_counts = [int(model["pca"].n_components_) for model in self.output_models]
+        self.component_counts = {
+            "input_patches": input_counts,
+            "input_total": int(sum(input_counts)),
+            "output_patches": output_counts,
+            "output_total": int(sum(output_counts)),
+            "output_guard_band": self.output_guard_band,
+            "output_context_patch_size": self.output_patch_size,
+        }
+        self.is_fitted = True
+        return self
+
+    def transform_outputs(self, y: np.ndarray) -> np.ndarray:
+        """Transform fields to guarded-context output PCA coordinates."""
+        self._require_fitted()
+        _check_field_shape(y, self.output_shape_, name="y")
+        patches = _extract_guarded_patches_2d(
+            y,
+            self.patch_slices,
+            self.output_guard_band,
+            padding_mode=self.guard_padding_mode,
+            flatten=True,
+        )
+        start = perf_counter()
+        result = _transform_patch_models(patches, self.output_models)
+        self.timings["transform_outputs"] = self.timings.get("transform_outputs", 0.0) + (
+            perf_counter() - start
+        )
+        return result.astype(np.float32, copy=False)
+
+    def inverse_transform_outputs(self, z: np.ndarray) -> np.ndarray:
+        """Decode guarded output PCA coordinates, crop cores, and assemble."""
+        self._require_fitted()
+        start = perf_counter()
+        guarded = _inverse_patch_models(
+            np.asarray(z),
+            self.output_models,
+            self.output_patch_size,
+        )
+        patches = _crop_patch_cores(guarded, self.output_guard_band, self.patch_size)
+        if self.assembly_weights is None:
+            result = assemble_patches_2d(
+                patches,
+                self.output_shape_,
+                self.patch_size,
+                self.stride,
+                mode="average",
+                include_edges=self.include_edges,
+            )
+        else:
+            result = assemble_weighted_patches_2d(
+                patches,
+                self.output_shape_,
+                self.patch_size,
+                self.stride,
+                self.assembly_weights,
+                include_edges=self.include_edges,
+            )
+        self.timings["inverse_transform_outputs"] = self.timings.get(
+            "inverse_transform_outputs", 0.0
+        ) + (perf_counter() - start)
+        return result.astype(np.float32, copy=False)
+
+
 class TwoScaleLocalToLocalPCAEncoder(LocalToLocalPCAEncoder):
     """Local input PCA with two-scale coarse-global plus local-residual output PCA."""
 
@@ -437,6 +583,7 @@ class TwoScaleLocalToLocalPCAEncoder(LocalToLocalPCAEncoder):
         coarse_factor: int = 4,
         coarse_components: int = 20,
         coarse_variance: float = 0.99,
+        coarse_solver: str = "randomized",
         grid_size: int | None = None,
         n_samples: int | None = None,
     ) -> None:
@@ -459,9 +606,15 @@ class TwoScaleLocalToLocalPCAEncoder(LocalToLocalPCAEncoder):
             raise ValueError("coarse_components must be positive.")
         if not 0.0 < coarse_variance <= 1.0:
             raise ValueError("coarse_variance must be in (0, 1].")
+        if coarse_solver not in {"full", "randomized"}:
+            raise ValueError(
+                "coarse_solver must be 'full' or 'randomized', "
+                f"got {coarse_solver!r}."
+            )
         self.coarse_factor = int(coarse_factor)
         self.coarse_components = int(coarse_components)
         self.coarse_variance = float(coarse_variance)
+        self.coarse_solver = coarse_solver
         if grid_size is not None and n_samples is not None:
             _validate_coarse_factor(
                 (int(grid_size), int(grid_size)),
@@ -506,7 +659,7 @@ class TwoScaleLocalToLocalPCAEncoder(LocalToLocalPCAEncoder):
         self.coarse_pca = fit_pca(
             y_coarse_scaled,
             min(self.coarse_components, min(y_coarse_scaled.shape) - 1),
-            solver="randomized",
+            solver=self.coarse_solver,
             oversampling=self.oversampling,
             n_iter=self.n_iter,
             random_state=self.random_state,
@@ -674,6 +827,82 @@ def _inverse_patch_models(
     if start != z.shape[1]:
         raise ValueError(f"Latent output has extra columns: consumed {start}, got {z.shape[1]}.")
     return np.stack(patches, axis=1)
+
+
+def _extract_guarded_patches_2d(
+    fields: np.ndarray,
+    patch_slices: list[tuple[slice, slice]],
+    guard_band: int,
+    *,
+    padding_mode: str = "edge",
+    flatten: bool = True,
+) -> np.ndarray:
+    fields = np.asarray(fields)
+    if fields.ndim != 3:
+        raise ValueError(f"fields must have shape (N, H, W), got {fields.shape}.")
+    if guard_band <= 0:
+        raise ValueError("guard_band must be positive.")
+    if not patch_slices:
+        raise ValueError("patch_slices cannot be empty.")
+    allowed_padding_modes = {
+        "edge",
+        "reflect",
+        "symmetric",
+        "wrap",
+        "constant",
+        "linear_ramp",
+        "maximum",
+        "mean",
+        "median",
+        "minimum",
+        "empty",
+    }
+    if padding_mode not in allowed_padding_modes:
+        raise ValueError(
+            f"Unsupported guard padding_mode {padding_mode!r}; "
+            f"expected one of {sorted(allowed_padding_modes)}."
+        )
+    core_height = int(patch_slices[0][0].stop - patch_slices[0][0].start)
+    core_width = int(patch_slices[0][1].stop - patch_slices[0][1].start)
+    if core_height != core_width:
+        raise ValueError("Guarded patches require square core patches.")
+    patch_size = core_height + 2 * int(guard_band)
+    padded = np.pad(
+        fields,
+        ((0, 0), (guard_band, guard_band), (guard_band, guard_band)),
+        mode=cast(Any, padding_mode),
+    )
+    patches = np.empty(
+        (fields.shape[0], len(patch_slices), patch_size, patch_size),
+        dtype=fields.dtype,
+    )
+    for patch_index, (row_slice, col_slice) in enumerate(patch_slices):
+        row_start = int(row_slice.start)
+        col_start = int(col_slice.start)
+        patches[:, patch_index] = padded[
+            :,
+            row_start : row_start + patch_size,
+            col_start : col_start + patch_size,
+        ]
+    if flatten:
+        return patches.reshape(fields.shape[0], len(patch_slices), patch_size * patch_size)
+    return patches
+
+
+def _crop_patch_cores(
+    patches: np.ndarray,
+    guard_band: int,
+    core_patch_size: int,
+) -> np.ndarray:
+    patches = np.asarray(patches)
+    if patches.ndim != 4:
+        raise ValueError(f"patches must have shape (N, P, H, W), got {patches.shape}.")
+    start = int(guard_band)
+    stop = start + int(core_patch_size)
+    expected = int(core_patch_size) + 2 * int(guard_band)
+    if patches.shape[2:] != (expected, expected):
+        raise ValueError(f"Expected guarded patch shape {(expected, expected)}, got {patches.shape[2:]}.")
+    return patches[:, :, start:stop, start:stop]
 
 
 def _flatten_fields(fields: np.ndarray) -> tuple[np.ndarray, tuple[int, ...]]:
