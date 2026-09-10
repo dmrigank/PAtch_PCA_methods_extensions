@@ -1,0 +1,29 @@
+{
+  "title": "Two-Scale Localized PCA-Net for Artifact-Reduced PDE Operator Learning",
+  "description": "Reproducibility code for two-scale localized PCA-Net: a coarse-global plus local-residual output representation for elliptic PDE operator learning, with optional interface-aware physical-field fine-tuning.",
+  "creators": [
+    {
+      "name": "Dhingra, Mrigank",
+      "orcid": "0009-0007-1188-7937"
+    },
+    {
+      "name": "Stout, Jordan"
+    },
+    {
+      "name": "San, Omer",
+      "orcid": "0000-0002-2241-4648"
+    }
+  ],
+  "version": "0.1.0",
+  "access_right": "open",
+  "upload_type": "software",
+  "language": "eng",
+  "keywords": [
+    "scientific machine learning",
+    "neural operators",
+    "proper orthogonal decomposition",
+    "principal component analysis",
+    "elliptic partial differential equations",
+    "domain decomposition"
+  ]
+}

@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata below."
+type: software
+title: "Two-Scale Localized PCA-Net for Artifact-Reduced PDE Operator Learning"
+version: 0.1.0
+repository-code: "https://github.com/dmrigank/PAtch_PCA_methods_extensions"
+authors:
+  - family-names: Dhingra
+    given-names: Mrigank
+    email: mdhingra@vols.utk.edu
+    orcid: "https://orcid.org/0009-0007-1188-7937"
+  - family-names: Stout
+    given-names: Jordan
+    email: jdstout@bu.edu
+  - family-names: San
+    given-names: Omer
+    email: osan@utk.edu
+    orcid: "https://orcid.org/0000-0002-2241-4648"

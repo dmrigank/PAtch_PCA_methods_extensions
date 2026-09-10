@@ -128,18 +128,15 @@ manuscript and inserted here once the dataset record is published.
 
 ## Citation
 
-```bibtex
-@article{TODO,
-  title   = {Localized PCA-Net with Interface Consistency by Construction},
-  author  = {TODO},
-  journal = {TODO},
-  year    = {TODO}
-}
-```
+GitHub recognizes the machine-readable metadata in `CITATION.cff`. Zenodo uses
+the release metadata in `.zenodo.json` when archiving a GitHub release. The
+version-specific Zenodo DOI will be added after the `v0.1.0` release is
+archived.
 
 This work builds on *Localized PCA-Net neural operators for scalable solution
 reconstruction of elliptic PDEs* (Dhingra, Maulik, Rasheed, San, 2026).
 
 ## License
 
-TODO (e.g. MIT).
+A software license must be selected by the maintainers before the public
+`v0.1.0` release.
