@@ -1,5 +1,7 @@
 # Two-Scale Localized PCA-Net for Artifact-Reduced PDE Operator Learning
 
+[![DOI](https://zenodo.org/badge/1258261173.svg)](https://doi.org/10.5281/zenodo.22695258)
+
 Patch-based PCA neural operators are a fast way to learn solution operators for
 elliptic PDEs, but reconstructing a field from independently decoded patches
 introduces **patch-interface artifacts**: visible blockiness, interface jumps,
