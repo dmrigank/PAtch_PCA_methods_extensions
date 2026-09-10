@@ -138,5 +138,4 @@ reconstruction of elliptic PDEs* (Dhingra, Maulik, Rasheed, San, 2026).
 
 ## License
 
-A software license must be selected by the maintainers before the public
-`v0.1.0` release.
+This project is released under the [MIT License](LICENSE).
