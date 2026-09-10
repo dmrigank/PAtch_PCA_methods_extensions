@@ -3,6 +3,7 @@
 /paper_assets/
 /results/
 /paper_results/
+/zenodo_uploads/
 /legacy/
 *.mat
 *.npz
